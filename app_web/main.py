@@ -308,3 +308,216 @@ async def done(m: types.Message):
 @dp.message(Command("chatid"))
 async def chatid(m: types.Message):
     await m.answer(f"Chat ID: {m.chat.id}")
+# -------- Deals: stages, list-as-buttons, deal card, close, comment
+@dp.message(Command("stages"))
+async def stages(m: types.Message):
+    if not DEAL_CATEGORY_ID:
+        await m.answer("Задайте DEAL_CATEGORY_ID у Secrets.")
+        return
+    try:
+        sts = list_deal_stages(DEAL_CATEGORY_ID)
+    except Exception as e:
+        await m.answer(f"Помилка отримання етапів: {e!s}")
+        return
+    if not sts:
+        await m.answer("Етапи не знайдено або нестачає прав.")
+        return
+    lines = [f"{(s.get('STATUS_ID') or s.get('ID'))}: {s.get('NAME')}" for s in sts]
+    await m.answer("Етапи цієї воронки:\n" + "\n".join(lines))
+
+
+async def _fetch_deals_page(stage_id: str, page: int):
+    start = page * PAGE_SIZE
+    res = list_deals(
+        {"CATEGORY_ID": DEAL_CATEGORY_ID, "STAGE_ID": stage_id},
+        ["ID", "TITLE", "STAGE_ID", "DATE_CREATE"],
+        {"ID": "DESC"},
+        start=start
+    )
+    items = res.get("result", [])
+    has_next = "next" in res
+    return items, has_next
+
+
+async def _render_deals_list(chat: types.Chat, team_name: str, stage_id: str, page: int):
+    items, has_next = await _fetch_deals_page(stage_id, page)
+    kb = InlineKeyboardBuilder()
+
+    if not items:
+        kb.button(text="🔄 Оновити", callback_data=f"deals:list:{page}:{stage_id}")
+        await bot.send_message(
+            chat.id,
+            f"{team_name} — угод не знайдено на цій сторінці.",
+            reply_markup=kb.as_markup()
+        )
+        return
+
+    for d in items:
+        did = int(d.get("ID"))
+        title = _short(d.get("TITLE") or f"Deal #{did}", 48)
+        kb.button(text=f"#{did} · {title}", callback_data=f"deal:{did}:{page}:{stage_id}")
+
+    if page > 0:
+        kb.button(text="◀️", callback_data=f"deals:list:{page-1}:{stage_id}")
+    if has_next:
+        kb.button(text="▶️", callback_data=f"deals:list:{page+1}:{stage_id}")
+
+    kb.adjust(1)
+    await bot.send_message(
+        chat.id,
+        f"🔧 *{team_name}* — угоди (стор. {page+1})",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.message(Command("deals"))
+async def deals_for_team(m: types.Message):
+    if not DEAL_CATEGORY_ID:
+        await m.answer("Задайте DEAL_CATEGORY_ID у Secrets (ID воронки, напр. 20).")
+        return
+    conn = await connect()
+    u = await get_user(conn, m.from_user.id)
+    await conn.close()
+    if not u or not u.get("team_id"):
+        await m.answer("Спочатку оберіть бригаду через /start.")
+        return
+    stage_id = await _resolve_team_stage_id(int(u["team_id"]))
+    if not stage_id:
+        await m.answer("Не знайшов етап для цієї бригади. Виконайте /stages і додайте TEAM_STAGE_MAP.")
+        return
+    await _render_deals_list(m.chat, TEAMS.get(int(u["team_id"]), "Бригада"), stage_id, page=0)
+
+
+@dp.callback_query(F.data.startswith("deals:list:"))
+async def cb_deals_list(c: types.CallbackQuery):
+    _, _, page, stage_id = c.data.split(":", 3)
+    await c.answer()
+    await _render_deals_list(c.message.chat, "Список угод", stage_id, int(page))
+
+
+@dp.callback_query(F.data.startswith("deal:"))
+async def cb_deal(c: types.CallbackQuery):
+    _, did, page, stage_id = c.data.split(":", 3)
+    deal_id = int(did)
+    try:
+        d = get_deal(deal_id)
+        rows = get_deal_products(deal_id)
+        address, phone, comment = _deal_brief_info(d)
+    except Exception as e:
+        await c.answer(f"Помилка: {e!s}", show_alert=True)
+        return
+
+    total = 0.0
+    cur = d.get("CURRENCY_ID") or ""
+    for r in rows or []:
+        try:
+            total += float(r.get("PRICE", 0) or 0) * float(r.get("QUANTITY", 1) or 1)
+        except Exception:
+            pass
+
+    title = (d.get("TITLE") or f"Deal #{deal_id}").strip()
+    lines = [f"*#{deal_id}:* {title}"]
+    if address:
+        lines.append(f"📍 {address}")
+    if phone:
+        lines.append(f"📞 {phone}")
+    if comment:
+        lines.append(f"💬 {_short(comment, 200)}")
+    if total > 0:
+        lines.append(f"💵 {total:.2f} {cur}")
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Закрити", callback_data=f"dealwon:{deal_id}:{page}:{stage_id}")
+    kb.button(text="📝 Комент", callback_data=f"dealcmt:{deal_id}:{page}:{stage_id}")
+    if phone:
+        kb.button(text="📞 Дзвінок", url=f"tel:{phone}")
+    if address:
+        link = _map_link(address)
+        if link:
+            kb.button(text="🗺️ Навігація", url=link)
+    kb.button(text="⬅️ Назад", callback_data=f"deals:list:{page}:{stage_id}")
+    kb.adjust(2)
+    try:
+        await c.message.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.as_markup())
+    except TelegramBadRequest:
+        await bot.send_message(c.message.chat.id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.as_markup())
+    finally:
+        await c.answer()
+
+
+@dp.callback_query(F.data.startswith("dealwon:"))
+async def cb_deal_won(c: types.CallbackQuery):
+    _, did, page, stage_id = c.data.split(":", 3)
+    deal_id = int(did)
+    if not DEAL_DONE_STAGE_ID:
+        await c.answer("Не задано DEAL_DONE_STAGE_ID у Secrets", show_alert=True)
+        return
+    try:
+        move_deal_to_stage(deal_id, DEAL_DONE_STAGE_ID)
+        await c.answer("Закрито ✅")
+        await _render_deals_list(c.message.chat, "Список угод", stage_id, int(page))
+    except Exception as e:
+        await c.answer(f"Помилка: {e!s}", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("dealcmt:"))
+async def cb_deal_comment_hint(c: types.CallbackQuery):
+    _, did, page, stage_id = c.data.split(":", 3)
+    await c.answer()
+    await c.message.answer(f"Надішліть коментар як:\n`/comment {did} ваш текст`", parse_mode=ParseMode.MARKDOWN)
+
+@dp.message(Command("comment"))
+async def add_deal_comment(m: types.Message):
+    parts = (m.text or "").split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        await m.answer("Приклад: `/comment 1137734 Я на місці, розпочинаємо`", parse_mode=ParseMode.MARKDOWN)
+        return
+    deal_id = int(parts[1])
+    text = parts[2].strip()
+    try:
+        comment_deal(deal_id, text)
+        await m.answer("Коментар додано ✅")
+    except Exception as e:
+        await m.answer(f"Не вдалося додати коментар: {e!s}")
+
+
+# -------- Reports
+@dp.message(Command("report_now"))
+async def report_now(m: types.Message):
+    text = await build_full_report()
+    await bot.send_message(settings.MASTER_REPORT_CHAT_ID, text)
+    await m.answer("Звіт відправлено в майстер-групу ✅")
+
+
+# -------- Webhook & health
+@app.get("/")
+async def health():
+    return PlainTextResponse("OK")
+
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret.strip() != settings.WEBHOOK_SECRET.strip():
+        return JSONResponse({"ok": False}, status_code=status.HTTP_404_NOT_FOUND)
+    update = types.Update.model_validate(await request.json(), context={"bot": bot})
+    try:
+        await dp.feed_update(bot, update)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+    return JSONResponse({"ok": True})
+
+
+@app.on_event("startup")
+async def on_startup():
+    await ensure_schema_and_seed()
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(
+        url=f"{settings.WEBHOOK_BASE}/webhook/{settings.WEBHOOK_SECRET}",
+        allowed_updates=["message", "callback_query"],
+    )
+
+    if getattr(settings, "RUN_WORKER_IN_APP", False):
+        asyncio.create_task(daily_loop())
+
