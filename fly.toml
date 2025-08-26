@@ -1,33 +1,26 @@
-app = "your-telegram-bitrix-bot"
-primary_region = "waw"
+# fly.toml
+app = "bot-crm-worker"   # назва твого застосунку
 
-[build]
-  dockerfile = "Dockerfile"
-
-[vm]
-  memory = 256
-  cpu_kind = "shared"
-  cpus = 1
-
-[env]
-  PORT = "8080"
-
-[[services]]
-  processes = ["app"]
-  internal_port = 8080
-  protocol = "tcp"
-  [[services.ports]]
-    handlers = ["tls", "http"]
-    port = 443
-  [[services.ports]]
-    handlers = ["http"]
-    port = 80
-  [[services.tcp_checks]]
-    interval = "15s"
-    timeout = "2s"
-    grace_period = "10s"
-
-# Якщо матимете другу машину для воркера:
 [processes]
-  app = "uvicorn app_web.main:app --host 0.0.0.0 --port 8080"
-  worker = "python -m worker.report_worker"
+app    = "uvicorn app_web.main:app --host 0.0.0.0 --port 8080"
+worker = "python -m worker.report_worker"
+
+# HTTP-обслуговування — лише для web-групи
+[http_service]
+internal_port = 8080
+force_https = true
+auto_start_machines = true
+auto_stop_machines  = "off"
+min_machines_running = 1
+
+# (Опційно) healthcheck, щоб розгортання чекало готовність вебу
+[[checks]]
+  grace_period = "5s"
+  interval = "10s"
+  timeout = "2s"
+  type = "http"
+  [checks.http]
+    method = "GET"
+    path = "/"
+    protocol = "http"
+    port = 8080
