@@ -1,72 +1,123 @@
 # worker/report_worker.py
-from __future__ import annotations
-import asyncio
-import logging
 import os
-from datetime import datetime, timedelta, timezone
+import json
+import asyncio
+import datetime as dt
 
-from shared.repo import ensure_schema_and_seed
+from aiogram import Bot
+from shared.settings import settings
+from shared.team_names import TEAMS
+from shared.tz import KYIV_TZ
+from shared.bx import list_deal_stages, list_deals
 
-# === Налаштування шедулера (опційно) ===
-REPORT_AT = os.getenv("REPORT_AT", "21:00")         # коли надсилати звіт (за замовч. 21:00)
-REPORT_TZ_OFFSET = os.getenv("REPORT_TZ_OFFSET", "+03:00")  # зсув з UTC (Київ влітку +03:00, взимку +02:00)
-ENABLE_DAILY_REPORT = os.getenv("ENABLE_DAILY_REPORT", "0") == "1"
+DEAL_CATEGORY_ID = int(os.getenv("DEAL_CATEGORY_ID", "0") or 0)
+try:
+    TEAM_STAGE_MAP = json.loads(os.getenv("TEAM_STAGE_MAP", "{}"))
+except Exception:
+    TEAM_STAGE_MAP = {}
 
+REPORT_HOUR = int(os.getenv("REPORT_HOUR", "19") or 19)
+REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "0") or 0)
 
-def _seconds_until_next(hhmm: str, tz_offset: str) -> float:
-    h, m = map(int, hhmm.split(":"))
-    sign = 1 if tz_offset[0] == "+" else -1
-    off_h, off_m = map(int, tz_offset[1:].split(":"))
-    tz = timezone(sign * timedelta(hours=off_h, minutes=off_m))
-    now = datetime.now(tz)
-    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
+def _normalize(s: str) -> str:
+    return "".join(str(s).lower().replace("№", "").split())
 
+def _resolve_team_stage_id(team_id: int) -> str:
+    # 1) з мапи, якщо задано
+    sid = str(TEAM_STAGE_MAP.get(str(team_id), TEAM_STAGE_MAP.get(team_id, ""))).strip()
+    if sid:
+        return sid
 
-async def _send_daily_report() -> None:
+    # 2) автоматичний підбір за назвою етапу
+    team_name = TEAMS.get(team_id, "")
+    if not (DEAL_CATEGORY_ID and team_name):
+        return ""
+    try:
+        stages = list_deal_stages(DEAL_CATEGORY_ID) or []
+    except Exception:
+        return ""
+
+    tn = _normalize(team_name)
+    for st in stages:
+        name = (st.get("NAME") or st.get("name") or "").strip()
+        code = st.get("STATUS_ID") or st.get("STATUSID") or st.get("ID") or st.get("id")
+        nrm = _normalize(name)
+        if tn in nrm or tn.replace("бригада", "brigada") in nrm:
+            return str(code)
+    return ""
+
+async def build_full_report() -> str:
+    now = dt.datetime.now(KYIV_TZ)
+    hdr = f"Щоденний звіт • {now.strftime('%d.%m %H:%M')}"
+
+    if not DEAL_CATEGORY_ID:
+        return f"{hdr}\n\nDEAL_CATEGORY_ID не задано в Secrets."
+
+    lines = [hdr, ""]
+    # По кожній бригаді підрахуємо кількість угод на її етапі
+    for tid, name in TEAMS.items():
+        sid = _resolve_team_stage_id(int(tid))
+        if not sid:
+            lines.append(f"• {name}: етап не знайдено (додайте в TEAM_STAGE_MAP)")
+            continue
+
+        total = 0
+        start = 0
+        has_next = True
+        # Зберемо до 1000 для адекватного підрахунку, пагінація через `next`
+        while has_next and total < 1000:
+            try:
+                res = list_deals(
+                    {"CATEGORY_ID": DEAL_CATEGORY_ID, "STAGE_ID": sid},
+                    ["ID"], {"ID": "DESC"},
+                    start=start
+                ) or {}
+            except Exception:
+                res = {}
+            items = res.get("result", []) or []
+            total += len(items)
+            if "next" in res:
+                start = int(res["next"])
+                has_next = True
+            else:
+                has_next = False
+
+        lines.append(f"• {name}: {total} угод на етапі")
+    return "\n".join(lines)
+
+async def daily_loop():
     """
-    Тут виклич свою реальну логіку формування/надсилання звіту.
-    Якщо в тебе є готова функція, імпортуй її тут і виклич.
-    Напр., з модуля worker.reporting:
-        from worker.reporting import generate_and_send_daily_report
-        await generate_and_send_daily_report()
-    Поки для надійності просто логнемо (щоб процес не падав, якщо імпорту ще немає).
+    Нескінченний цикл: чекає до наступного REPORT_HOUR:REPORT_MINUTE (за Києвом),
+    збирає звіт і надсилає в MASTER_REPORT_CHAT_ID.
     """
-    logging.info("Daily report tick: тут має бути виклик generate_and_send_daily_report()")
-
-
-async def _scheduler_loop() -> None:
-    # перше очікування до найближчого вікна REPORT_AT
-    wait_first = _seconds_until_next(REPORT_AT, REPORT_TZ_OFFSET)
-    logging.info("Scheduler armed: first run in %.0f sec (at %s, tz %s)", wait_first, REPORT_AT, REPORT_TZ_OFFSET)
-    await asyncio.sleep(wait_first)
-    while True:
+    bot = Bot(settings.BOT_TOKEN)
+    # опціональний миттєвий стартовий репорт
+    if os.getenv("REPORT_SEND_ON_START", "0") in ("1", "true", "True"):
         try:
-            await _send_daily_report()
-        except Exception:
-            logging.exception("Daily report failed")
-        # далі кожні 24 години
-        await asyncio.sleep(24 * 60 * 60)
+            txt = await build_full_report()
+            await bot.send_message(settings.MASTER_REPORT_CHAT_ID, txt)
+        except Exception as e:
+            await bot.send_message(settings.MASTER_REPORT_CHAT_ID, f"Не вдалося зібрати звіт: {e!s}")
 
+    while True:
+        now = dt.datetime.now(KYIV_TZ)
+        target = now.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
+        if now >= target:
+            target += dt.timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
 
-async def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    logging.info("report-worker starting...")
-    # тримаємо схему в актуальному стані
-    await ensure_schema_and_seed()
+        try:
+            txt = await build_full_report()
+            await bot.send_message(settings.MASTER_REPORT_CHAT_ID, txt)
+        except Exception as e:
+            # пробуємо повідомити про помилку, щоб не мовчати
+            try:
+                await bot.send_message(settings.MASTER_REPORT_CHAT_ID, f"Не вдалося зібрати звіт: {e!s}")
+            except Exception:
+                pass
 
-    # Запускаємо фоновий шедулер лише якщо увімкнено прапорцем
-    if ENABLE_DAILY_REPORT:
-        asyncio.create_task(_scheduler_loop())
-        logging.info("Scheduler enabled (REPORT_AT=%s, REPORT_TZ_OFFSET=%s)", REPORT_AT, REPORT_TZ_OFFSET)
-    else:
-        logging.info("Scheduler disabled (set ENABLE_DAILY_REPORT=1 to enable)")
-
-    # ГОЛОВНЕ: не завершувати процес
-    await asyncio.Event().wait()
-
+        # щоб не відправити двічі в одну хвилину
+        await asyncio.sleep(65)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(daily_loop())
