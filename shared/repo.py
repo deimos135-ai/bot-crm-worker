@@ -1,14 +1,17 @@
 # shared/repo.py
 from __future__ import annotations
-import os
+
 import asyncpg
 from typing import Optional, Dict, Any
 from shared.settings import settings
 
 
+# ---------- базове підключення та схема ----------
+
 async def connect() -> asyncpg.Connection:
-    # Підтримка sslmode=require в DATABASE_URL (рекомендовано для Fly Postgres)
-    return await asyncpg.connect(settings.DATABASE_URL, timeout=10)
+    # Рекомендовано, щоб DATABASE_URL містив sslmode=require для Fly Postgres
+    # Додаємо невеликий таймаут, щоб уникати зависань
+    return await asyncpg.connect(settings.DATABASE_URL, timeout=15)
 
 
 async def ensure_schema_and_seed() -> None:
@@ -29,7 +32,7 @@ async def ensure_schema_and_seed() -> None:
         await conn.close()
 
 
-# ---- API, на яке зазвичай спирається main.py ----
+# ---------- API, яке викликає main.py ----------
 
 async def get_user(chat_id: int) -> Optional[Dict[str, Any]]:
     conn = await connect()
@@ -76,6 +79,28 @@ async def set_team(chat_id: int, team_id: str, team_name: Optional[str] = None) 
     try:
         await conn.execute(
             "UPDATE tg_users SET team_id=$2, team_name=$3, updated_at=now() WHERE chat_id=$1",
+            chat_id, team_id, team_name
+        )
+    finally:
+        await conn.close()
+
+
+async def upsert_user_team(chat_id: int, team_id: str, team_name: Optional[str] = None) -> None:
+    """
+    Використовується там, де потрібно одночасно створити користувача (якщо немає)
+    та оновити його команду.
+    """
+    conn = await connect()
+    try:
+        await conn.execute(
+            """
+            INSERT INTO tg_users (chat_id, team_id, team_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (chat_id) DO UPDATE
+            SET team_id = EXCLUDED.team_id,
+                team_name = COALESCE(EXCLUDED.team_name, tg_users.team_name),
+                updated_at = now()
+            """,
             chat_id, team_id, team_name
         )
     finally:
