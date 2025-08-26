@@ -305,6 +305,6 @@ async def done(m: types.Message):
         await m.answer(f"Не вдалося завершити #{task_id}: {e!s}")
 
 
-@dp.message(Command("chatid")))
+@dp.message(Command("chatid"))
 async def chatid(m: types.Message):
     await m.answer(f"Chat ID: {m.chat.id}")
