@@ -4,6 +4,11 @@ primary_region = "waw"
 [build]
   dockerfile = "Dockerfile"
 
+[vm]
+  memory = 256
+  cpu_kind = "shared"
+  cpus = 1
+
 [env]
   PORT = "8080"
 
