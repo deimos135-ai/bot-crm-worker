@@ -17,7 +17,7 @@ from shared.settings import settings
 from shared.team_names import TEAMS
 from shared.tz import KYIV_TZ
 from shared.repo import (
-    connect, get_user, upsert_user_team,
+    get_user, upsert_user_team,
     ensure_schema_and_seed, set_user_bitrix_id
 )
 from shared.bx import (
@@ -121,15 +121,21 @@ app = FastAPI()
 # -------- Start & team
 @dp.message(CommandStart())
 async def start(m: types.Message):
-    conn = await connect()
-    row = await get_user(conn, m.from_user.id)
-    await conn.close()
+    row = await get_user(m.from_user.id)
 
     if row and row.get("team_id"):
+        # team_id зберігаємо як TEXT; спробуємо конвертувати в int для TEAMS
+        team_label = row.get("team_name")
+        if not team_label:
+            tid = row.get("team_id")
+            if tid and str(tid).isdigit():
+                team_label = TEAMS.get(int(tid), "?")
+            else:
+                team_label = "?"
         kb = InlineKeyboardBuilder()
         kb.button(text="🔁 Змінити бригаду", callback_data="team:change")
         await m.answer(
-            f"Ви у бригаді: *{TEAMS.get(row['team_id'], '?')}*.\nГотові працювати ✅",
+            f"Ви у бригаді: *{team_label}*.\nГотові працювати ✅",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.as_markup(),
         )
@@ -160,11 +166,8 @@ async def change_team(c: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("team:set:"))
 async def team_set(c: types.CallbackQuery):
     tid = int(c.data.split(":")[-1])
-    full_name = f"{c.from_user.first_name or ''} {c.from_user.last_name or ''}".strip()
-
-    conn = await connect()
-    await upsert_user_team(conn, c.from_user.id, full_name, tid)
-    await conn.close()
+    # Зберігаємо і ID (як TEXT), і дружню назву
+    await upsert_user_team(c.from_user.id, str(tid), TEAMS.get(tid))
 
     text = f"Бригаду встановлено: *{TEAMS.get(tid, '—')}*. Готово ✅"
     try:
@@ -179,12 +182,18 @@ async def team_set(c: types.CallbackQuery):
 # -------- Bind & whoami
 @dp.message(Command("whoami"))
 async def whoami(m: types.Message):
-    conn = await connect()
-    u = await get_user(conn, m.from_user.id)
-    await conn.close()
-    team = TEAMS.get(u["team_id"]) if u and u.get("team_id") else "—"
+    u = await get_user(m.from_user.id)
+    team_txt = "—"
+    if u and u.get("team_id"):
+        if u.get("team_name"):
+            team_txt = u["team_name"]
+        else:
+            try:
+                team_txt = TEAMS.get(int(u["team_id"]), "—")
+            except Exception:
+                team_txt = "—"
     bx = u.get("bitrix_user_id") if u else None
-    await m.answer(f"TG: {m.from_user.id}\nTeam: {team}\nBitrix ID: {bx or 'не прив’язано'}")
+    await m.answer(f"TG: {m.from_user.id}\nTeam: {team_txt}\nBitrix ID: {bx or 'не прив’язано'}")
 
 @dp.message(Command("bind"))
 async def bind_email(m: types.Message):
@@ -200,9 +209,7 @@ async def bind_email(m: types.Message):
         if not bx_id:
             await m.answer("Не знайшов користувача в Bitrix за цим email 🤔")
             return
-        conn = await connect()
-        await set_user_bitrix_id(conn, m.from_user.id, bx_id)
-        await conn.close()
+        await set_user_bitrix_id(m.from_user.id, bx_id)
         await m.answer(f"Прив’язано Bitrix ID: {bx_id} ✅")
     except Exception as e:
         await m.answer(f"Не вдалось прив’язати: {e!s}")
@@ -214,9 +221,7 @@ async def my_tasks(m: types.Message):
     args = (m.text or "").split()[1:]
     mode = (args[0] if args else "open").lower()
 
-    conn = await connect()
-    u = await get_user(conn, m.from_user.id)
-    await conn.close()
+    u = await get_user(m.from_user.id)
     bx_id = u["bitrix_user_id"] if u else None
     if not bx_id:
         await m.answer("Спочатку прив’яжіть Bitrix e-mail: `/bind user@company.com`", parse_mode=ParseMode.MARKDOWN)
@@ -308,6 +313,8 @@ async def done(m: types.Message):
 @dp.message(Command("chatid"))
 async def chatid(m: types.Message):
     await m.answer(f"Chat ID: {m.chat.id}")
+
+
 # -------- Deals: stages, list-as-buttons, deal card, close, comment
 @dp.message(Command("stages"))
 async def stages(m: types.Message):
@@ -376,17 +383,21 @@ async def deals_for_team(m: types.Message):
     if not DEAL_CATEGORY_ID:
         await m.answer("Задайте DEAL_CATEGORY_ID у Secrets (ID воронки, напр. 20).")
         return
-    conn = await connect()
-    u = await get_user(conn, m.from_user.id)
-    await conn.close()
+    u = await get_user(m.from_user.id)
     if not u or not u.get("team_id"):
         await m.answer("Спочатку оберіть бригаду через /start.")
         return
-    stage_id = await _resolve_team_stage_id(int(u["team_id"]))
+    try:
+        stage_id = await _resolve_team_stage_id(int(u["team_id"]))
+    except Exception:
+        await m.answer("Некоректний team_id. Оберіть бригаду ще раз через /start.")
+        return
+
+    team_label = u.get("team_name") or TEAMS.get(int(u["team_id"]), "Бригада")
     if not stage_id:
         await m.answer("Не знайшов етап для цієї бригади. Виконайте /stages і додайте TEAM_STAGE_MAP.")
         return
-    await _render_deals_list(m.chat, TEAMS.get(int(u["team_id"]), "Бригада"), stage_id, page=0)
+    await _render_deals_list(m.chat, team_label, stage_id, page=0)
 
 
 @dp.callback_query(F.data.startswith("deals:list:"))
@@ -513,11 +524,18 @@ async def on_startup():
     await ensure_schema_and_seed()
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(
-        url=f"{settings.WEBHOOK_BASE}/webhook/{settings.WEBHOOK_SECRET}",
-        allowed_updates=["message", "callback_query"],
-    )
+    # необов'язково, але корисно мати таймаут, щоб старт не висів
+    try:
+        await asyncio.wait_for(
+            bot.set_webhook(
+                url=f"{settings.WEBHOOK_BASE}/webhook/{settings.WEBHOOK_SECRET}",
+                allowed_updates=["message", "callback_query"],
+            ),
+            timeout=10
+        )
+    except Exception as e:
+        print(f"Webhook setup warning: {e}")
 
+    # воркер НЕ запускаємо тут; керуємось секретом
     if getattr(settings, "RUN_WORKER_IN_APP", False):
         asyncio.create_task(daily_loop())
-
