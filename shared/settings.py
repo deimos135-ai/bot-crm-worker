@@ -1,5 +1,35 @@
 import os
 
+
+def _must(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise RuntimeError(f"Missing required env: {name}")
+    return v
+
+
+class Settings:
+    # Telegram
+    BOT_TOKEN: str = _must("BOT_TOKEN")
+
+    # Webhook
+    WEBHOOK_BASE: str = _must("WEBHOOK_BASE")  # https://<your-app>.fly.dev
+    WEBHOOK_SECRET: str = _must("WEBHOOK_SECRET")  # довільний секрет
+
+    # Bitrix (вхідний вебхук типу https://<portal>/rest/<user>/<token>/ )
+    BITRIX_WEBHOOK_BASE: str = _must("BITRIX_WEBHOOK_BASE").rstrip("/")
+
+    # DB
+    DATABASE_URL: str = _must("DATABASE_URL")  # ...?sslmode=require
+    MASTER_REPORT_CHAT_ID: str = _must("MASTER_REPORT_CHAT_ID")  # група керівників
+
+    # Workers
+    RUN_WORKER_IN_APP: bool = os.getenv("RUN_WORKER_IN_APP", "false").lower() == "true"
+
+
+settings = Settings()
+import os
+
 def _must(name: str) -> str:
     v = os.getenv(name)
     if not v:
