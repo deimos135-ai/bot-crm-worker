@@ -6,13 +6,12 @@ from typing import Optional, Dict, Any
 from shared.settings import settings
 
 
-# ---------- базове підключення та схема ----------
+# ---------- Підключення та ініціалізація схеми ----------
 
 async def connect() -> asyncpg.Connection:
-    # Рекомендовано, щоб DATABASE_URL містив sslmode=require для Fly Postgres
-    # Додаємо невеликий таймаут, щоб уникати зависань
+    # Переконайся, що DATABASE_URL має sslmode=require, якщо це Fly Postgres
+    # Додаємо таймаут, щоб уникнути зависань
     return await asyncpg.connect(settings.DATABASE_URL, timeout=15)
-
 
 async def ensure_schema_and_seed() -> None:
     conn = await connect()
@@ -32,7 +31,7 @@ async def ensure_schema_and_seed() -> None:
         await conn.close()
 
 
-# ---------- API, яке викликає main.py ----------
+# ---------- Операції з користувачем та командою ----------
 
 async def get_user(chat_id: int) -> Optional[Dict[str, Any]]:
     conn = await connect()
@@ -44,7 +43,6 @@ async def get_user(chat_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
     finally:
         await conn.close()
-
 
 async def upsert_user(chat_id: int, bitrix_user_id: Optional[int] = None) -> None:
     conn = await connect()
@@ -62,8 +60,8 @@ async def upsert_user(chat_id: int, bitrix_user_id: Optional[int] = None) -> Non
     finally:
         await conn.close()
 
-
-async def set_bitrix_user(chat_id: int, bitrix_user_id: int) -> None:
+async def set_user_bitrix_id(chat_id: int, bitrix_user_id: int) -> None:
+    """Саме цю назву імпортує main.py."""
     conn = await connect()
     try:
         await conn.execute(
@@ -73,6 +71,8 @@ async def set_bitrix_user(chat_id: int, bitrix_user_id: int) -> None:
     finally:
         await conn.close()
 
+# Синонім — якщо десь лишилась стара назва
+set_bitrix_user = set_user_bitrix_id
 
 async def set_team(chat_id: int, team_id: str, team_name: Optional[str] = None) -> None:
     conn = await connect()
@@ -84,11 +84,9 @@ async def set_team(chat_id: int, team_id: str, team_name: Optional[str] = None) 
     finally:
         await conn.close()
 
-
 async def upsert_user_team(chat_id: int, team_id: str, team_name: Optional[str] = None) -> None:
     """
-    Використовується там, де потрібно одночасно створити користувача (якщо немає)
-    та оновити його команду.
+    Створює користувача, якщо його нема, та оновлює команду.
     """
     conn = await connect()
     try:
@@ -97,7 +95,7 @@ async def upsert_user_team(chat_id: int, team_id: str, team_name: Optional[str] 
             INSERT INTO tg_users (chat_id, team_id, team_name)
             VALUES ($1, $2, $3)
             ON CONFLICT (chat_id) DO UPDATE
-            SET team_id = EXCLUDED.team_id,
+            SET team_id   = EXCLUDED.team_id,
                 team_name = COALESCE(EXCLUDED.team_name, tg_users.team_name),
                 updated_at = now()
             """,
@@ -105,7 +103,6 @@ async def upsert_user_team(chat_id: int, team_id: str, team_name: Optional[str] 
         )
     finally:
         await conn.close()
-
 
 async def get_team(chat_id: int) -> Optional[Dict[str, Any]]:
     conn = await connect()
