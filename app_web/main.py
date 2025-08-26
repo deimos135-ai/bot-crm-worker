@@ -8,6 +8,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
+from starlette import status
 
 from shared.settings import settings
 from shared.team_names import TEAMS
@@ -163,4 +164,94 @@ async def my_tasks(m: types.Message):
 
     now = dt.datetime.now(KYIV_TZ)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_en_
+    day_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
+
+    if mode in ("today", "сьогодні"):
+        filt = {"RESPONSIBLE_ID": bx_id, ">=DEADLINE": day_start.isoformat(), "<=DEADLINE": day_end.isoformat()}
+        header = "Завдання на сьогодні"
+    elif mode in ("overdue", "прострочені", "over"):
+        filt = {"RESPONSIBLE_ID": bx_id, "<DEADLINE": now.isoformat(), "!STATUS": 5}
+        header = "Прострочені завдання"
+    elif mode in ("closed_today", "done_today"):
+        filt = {"RESPONSIBLE_ID": bx_id, ">=CLOSED_DATE": day_start.isoformat(), "<=CLOSED_DATE": day_end.isoformat()}
+        header = "Сьогодні закриті"
+    else:
+        # відкриті
+        filt = {"RESPONSIBLE_ID": bx_id, "!STATUS": 5}
+        header = "Відкриті завдання"
+
+    try:
+        res = list_tasks(filt, ["ID","TITLE","DEADLINE","STATUS","CLOSED_DATE"])
+    except Exception as e:
+        await m.answer(f"Не вдалося отримати задачі: {e!s}")
+        return
+
+    tasks = _normalize_tasks(res)
+    if not tasks:
+        await m.answer("Задач за запитом не знайдено 🙂")
+        return
+
+    status_map = {1:"Нова",2:"В очікуванні",3:"В роботі",4:"Відкладена",5:"Завершена"}
+
+    lines = []
+    for t in tasks[:20]:
+        tid = _g(t,"id","ID")
+        title = _g(t,"title","TITLE") or ""
+        deadline = _g(t,"deadline","DEADLINE")
+        status = _g(t,"status","STATUS")
+
+        dl_str = ""
+        if deadline:
+            try:
+                dl = dt.datetime.fromisoformat(str(deadline).replace("Z","+00:00")).astimezone(KYIV_TZ)
+                dl_str = dl.strftime("%d.%m %H:%M")
+            except Exception:
+                dl_str = str(deadline)
+
+        status_txt = status_map.get(int(status)) if str(status).isdigit() else (str(status) if status else "")
+        suffix = f" • до {dl_str}" if dl_str else ""
+        extra = f" ({status_txt})" if status_txt and mode not in ("closed_today",) else ""
+        lines.append(f"• #{tid}: {title}{suffix}{extra}")
+
+    await m.answer(f"{header} (до 20):\n" + "\n".join(lines))
+
+
+# ---- Згенерувати звіт зараз
+@dp.message(Command("report_now"))
+async def report_now(m: types.Message):
+    text = await build_full_report()
+    await bot.send_message(settings.MASTER_REPORT_CHAT_ID, text)
+    await m.answer("Звіт відправлено в майстер-групу ✅")
+
+
+# ---- FastAPI webhook (динамічний шлях з перевіркою секрету)
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret.strip() != settings.WEBHOOK_SECRET.strip():
+        # маскуємося під 404, щоб не світити ендпоінт
+        return JSONResponse({"ok": False}, status_code=status.HTTP_404_NOT_FOUND)
+
+    update = types.Update.model_validate(await request.json(), context={"bot": bot})
+    try:
+        await dp.feed_update(bot, update)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+    return JSONResponse({"ok": True})
+
+
+@app.on_event("startup")
+async def on_startup():
+    # 1) БД та seed
+    await ensure_schema_and_seed()
+
+    # 2) Реєструємо Telegram webhook
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(
+        url=f"{settings.WEBHOOK_BASE}/webhook/{settings.WEBHOOK_SECRET}",
+        allowed_updates=["message", "callback_query"],
+    )
+
+    # 3) Планувальник звітів у цьому процесі (якщо RUN_WORKER_IN_APP=1)
+    if getattr(settings, "RUN_WORKER_IN_APP", False):
+        asyncio.create_task(daily_loop())
