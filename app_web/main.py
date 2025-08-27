@@ -1,8 +1,8 @@
-# app_web/main.py
 import os
 import json
 import asyncio
 import datetime as dt
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
@@ -23,9 +23,9 @@ from shared.repo import (
 )
 from shared.bx import (
     # tasks
-    list_tasks, complete_task, add_comment, search_user_by_email,
+    list_tasks, complete_task, add_comment, search_user_by_email, get_task,
     # deals
-    list_deal_stages, list_deals, move_deal_to_stage, comment_deal
+    list_deal_stages, list_deals, move_deal_to_stage, comment_deal, get_deal, get_contact
 )
 from worker.report_worker import daily_loop, build_full_report
 
@@ -83,7 +83,9 @@ async def start(m: types.Message):
 
     if row and row["team_id"]:
         kb = InlineKeyboardBuilder()
+        kb.button(text="📋 Мої задачі", callback_data="tasks:open:1")
         kb.button(text="🔁 Змінити бригаду", callback_data="team:change")
+        kb.adjust(1, 1)
         await m.answer(
             f"Ви у бригаді: *{TEAMS.get(row['team_id'], '?')}*.\nГотові працювати ✅",
             parse_mode=ParseMode.MARKDOWN,
@@ -123,8 +125,11 @@ async def team_set(c: types.CallbackQuery):
     await conn.close()
 
     text = f"Бригаду встановлено: *{TEAMS.get(tid, '—')}*. Готово ✅"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Мої задачі", callback_data="tasks:open:1")
+    kb.adjust(1)
     try:
-        await c.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+        await c.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb.as_markup())
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e):
             raise
@@ -165,7 +170,8 @@ async def bind_email(m: types.Message):
         await m.answer(f"Не вдалось прив’язати: {e!s}")
 
 
-# ========= TASKS (4 role-queries merged) =========
+# ========= TASKS =========
+
 def _normalize_tasks(res):
     if isinstance(res, dict) and "tasks" in res:
         return res["tasks"]
@@ -174,6 +180,86 @@ def _normalize_tasks(res):
     if isinstance(res, list):
         return res
     return []
+
+def _extract_deal_id_from_task(task: dict) -> Optional[int]:
+    """
+    Повертає ID угоди з UF_CRM_TASK (елементи типу 'D_<id>').
+    """
+    candidates = (
+        task.get("UF_CRM_TASK")
+        or task.get("ufCrmTask")
+        or task.get("UF_CRM", {})
+    )
+    if not candidates:
+        return None
+    if isinstance(candidates, dict) and "task" in candidates:
+        candidates = candidates["task"]
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    for s in candidates:
+        s = str(s or "")
+        if s.startswith("D_"):
+            try:
+                return int(s.split("_", 1)[1])
+            except Exception:
+                continue
+    return None
+
+def _format_deal_for_message(deal: dict, contact: Optional[dict]) -> str:
+    # ⚠️ заміни UF_* на свої ключі, якщо вони відрізняються
+    type_id    = deal.get("TYPE_ID") or "—"
+    category   = deal.get("CATEGORY_ID") or deal.get("CATEGORY") or "—"
+    comment    = (deal.get("COMMENTS") or "").strip() or "—"
+    address    = deal.get("ADDRESS") or deal.get("UF_CRM_ADDRESS") or "—"
+
+    router     = deal.get("UF_CRM_ROUTER") or "—"
+    router_sum = deal.get("UF_CRM_ROUTER_PRICE") or deal.get("UF_CRM_ROUTER_SUM") or "—"
+
+    contact_line = "—"
+    if contact:
+        name = " ".join(filter(None, [contact.get("NAME"), contact.get("SECOND_NAME"), contact.get("LAST_NAME")])).strip()
+        phone = ""
+        if isinstance(contact.get("PHONE"), list) and contact["PHONE"]:
+            phone = contact["PHONE"][0].get("VALUE") or ""
+        contact_line = f"{name or 'Контакт'} {phone}".strip()
+
+    lines = [
+        f"Тип сделки: {type_id}",
+        f"Категорія: {category}",
+        f"Коментар: {comment}",
+        f"Адреса: {address}",
+        f"Роутер: {router}",
+        f"Вартість роутера: {router_sum}",
+        f"Контакт: {contact_line}",
+    ]
+    return "\n".join(lines)
+
+def _task_line(t: dict, mode: str) -> str:
+    status_map = {1:"Нова",2:"В очікуванні",3:"В роботі",4:"Відкладена",5:"Завершена"}
+    tid = t.get("ID") or t.get("id")
+    title = (t.get("TITLE") or t.get("title") or "").strip()
+    deadline = t.get("DEADLINE") or t.get("deadline")
+    status = t.get("STATUS") or t.get("status")
+
+    dl_str = ""
+    if deadline:
+        try:
+            dl = dt.datetime.fromisoformat(str(deadline).replace("Z","+00:00")).astimezone(KYIV_TZ)
+            dl_str = dl.strftime("%d.%m %H:%M")
+        except Exception:
+            dl_str = str(deadline)
+
+    status_txt = status_map.get(int(status)) if str(status).isdigit() else (str(status) if status else "")
+    suffix = f" • до {dl_str}" if dl_str else ""
+    extra_s = f" ({status_txt})" if status_txt and mode not in ("closed_today",) else ""
+    return f"• #{tid}: {title}{suffix}{extra_s}"
+
+def _build_task_row_kb(tid: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="ℹ️ Деталі", callback_data=f"task:details:{tid}")
+    kb.button(text="✅ Закрити", callback_data=f"task:done:{tid}")
+    kb.adjust(2)
+    return kb.as_markup()
 
 @dp.message(Command("tasks"))
 async def my_tasks(m: types.Message):
@@ -207,7 +293,8 @@ async def my_tasks(m: types.Message):
     else:
         extra = {"!STATUS": 5}
 
-    fields = ["ID","TITLE","DEADLINE","STATUS","CLOSED_DATE","RESPONSIBLE_ID","CREATED_BY"]
+    # обов’язково беремо UF_CRM_TASK, щоб мати зв’язок із CRM
+    fields = ["ID","TITLE","DEADLINE","STATUS","CLOSED_DATE","RESPONSIBLE_ID","CREATED_BY","UF_CRM_TASK"]
     filters = [
         {"RESPONSIBLE_ID": bx_id, **extra},
         {"ACCOMPLICE": bx_id, **extra},
@@ -232,50 +319,66 @@ async def my_tasks(m: types.Message):
         await m.answer("Задач за запитом не знайдено 🙂")
         return
 
-    status_map = {1:"Нова",2:"В очікуванні",3:"В роботі",4:"Відкладена",5:"Завершена"}
-    lines = []
+    await m.answer(f"{header} (до 20):")
     for t in tasks[:20]:
-        tid = t.get("ID") or t.get("id")
-        title = (t.get("TITLE") or t.get("title") or "").strip()
-        deadline = t.get("DEADLINE") or t.get("deadline")
-        status = t.get("STATUS") or t.get("status")
-
-        dl_str = ""
-        if deadline:
-            try:
-                dl = dt.datetime.fromisoformat(str(deadline).replace("Z","+00:00")).astimezone(KYIV_TZ)
-                dl_str = dl.strftime("%d.%m %H:%M")
-            except Exception:
-                dl_str = str(deadline)
-
-        status_txt = status_map.get(int(status)) if str(status).isdigit() else (str(status) if status else "")
-        suffix = f" • до {dl_str}" if dl_str else ""
-        extra_s = f" ({status_txt})" if status_txt and mode not in ("closed_today",) else ""
-        lines.append(f"• #{tid}: {title}{suffix}{extra_s}")
-
-    await m.answer(f"{header} (до 20):\n" + "\n".join(lines))
+        tid = int(t.get("ID") or t.get("id"))
+        await m.answer(_task_line(t, mode), reply_markup=_build_task_row_kb(tid))
 
 
-# ========= QUICK TASK ACTIONS =========
-@dp.message(Command("done"))
-async def done(m: types.Message):
-    parts = (m.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await m.answer("Приклад: `/done 1234 коментар`", parse_mode=ParseMode.MARKDOWN)
-        return
-    task_id = int(parts[1])
-    comment = " ".join(parts[2:]) or "Завершено через Telegram-бот"
+# ======== CALLBACKS: details / done ========
+
+@dp.callback_query(F.data.startswith("task:details:"))
+async def task_details(c: types.CallbackQuery):
+    tid = int(c.data.split(":")[-1])
     try:
-        complete_task(task_id)
-        add_comment(task_id, comment)
-        await m.answer(f"Задачу #{task_id} завершено ✅")
+        task = get_task(tid) or {}
+        deal_id = _extract_deal_id_from_task(task)
+
+        deal, contact = {}, None
+        if deal_id:
+            deal = get_deal(deal_id) or {}
+            if deal.get("CONTACT_ID"):
+                try:
+                    contact = get_contact(int(deal["CONTACT_ID"])) or None
+                except Exception:
+                    contact = None
+
+        title = (task.get("TITLE") or "").strip()
+        head = f"# {tid} • {title}" if title else f"# {tid}"
+        body = _format_deal_for_message(deal, contact) if deal else "Прив’язану угоду не знайдено."
+        text = f"{head}\n\n{body}"
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Закрити", callback_data=f"task:done:{tid}")
+        kb.button(text="🔙 До списку", callback_data="tasks:open:1")
+        kb.adjust(2)
+
+        try:
+            await c.message.edit_text(text, reply_markup=kb.as_markup())
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                raise
+        await c.answer()
     except Exception as e:
-        await m.answer(f"Не вдалося завершити #{task_id}: {e!s}")
+        await c.answer("Помилка завантаження деталей", show_alert=True)
 
 
-@dp.message(Command("chatid"))
-async def chatid(m: types.Message):
-    await m.answer(f"Chat ID: {m.chat.id}")
+@dp.callback_query(F.data.startswith("task:done:"))
+async def task_done_cb(c: types.CallbackQuery):
+    tid = int(c.data.split(":")[-1])
+    try:
+        complete_task(tid)
+        try:
+            add_comment(tid, "Закрито через Telegram-бот ✅")
+        except Exception:
+            pass
+        await c.answer("Задачу закрито ✅", show_alert=False)
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+    except Exception as e:
+        await c.answer(f"Не вдалося закрити: {e!s}", show_alert=True)
 
 
 # ========= DEALS (CRM) =========
