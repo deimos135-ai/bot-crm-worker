@@ -36,13 +36,13 @@ async def _get_pool() -> asyncpg.Pool:
     if _POOL is not None:
         return _POOL
     url = _ensure_sslmode(settings.DATABASE_URL)
-    # створюємо пул 1..5 конектів; таймаути скромні, щоб не висіло
     _POOL = await asyncpg.create_pool(
         dsn=url,
         min_size=1,
         max_size=5,
-        timeout=10,            # час на встановлення конекту
-        command_timeout=30,    # дефолт на виконання запитів
+        timeout=10,
+        command_timeout=30,
+        statement_cache_size=0,   # <— КЛЮЧОВЕ: оффимо кеш prepared statements для PgBouncer
     )
     return _POOL
 
