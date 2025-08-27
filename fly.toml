@@ -6,6 +6,11 @@ primary_region = "waw"
 
 [env]
   PORT = "8080"
+  
+[vm]
+  memory = 512
+  cpu_kind = "shared"
+  cpus = 1
 
 [[services]]
   processes = ["app"]
