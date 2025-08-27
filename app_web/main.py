@@ -60,7 +60,21 @@ async def _resolve_team_stage_id(team_id: int) -> str:
         if tn in nrm or tn.replace("бригада", "brigada") in nrm:
             return str(code)
     return ""
+# у app_web/main.py, в on_startup():
+@app.on_event("startup")
+async def on_startup():
+    await ensure_schema_and_seed()
 
+    await bot.delete_webhook(drop_pending_updates=True)
+    url = f"{settings.WEBHOOK_BASE}/webhook/{settings.WEBHOOK_SECRET}"
+    print("[startup] setting webhook to:", url)   # <— ДОДАНО
+    await bot.set_webhook(
+        url=url,
+        allowed_updates=["message", "callback_query"],
+    )
+
+    if getattr(settings, "RUN_WORKER_IN_APP", False):
+        asyncio.create_task(daily_loop())
 
 # --------- Bot / Web
 bot = Bot(settings.BOT_TOKEN)
