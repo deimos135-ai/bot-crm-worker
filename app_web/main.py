@@ -324,6 +324,86 @@ async def my_tasks(m: types.Message):
         tid = int(t.get("ID") or t.get("id"))
         await m.answer(_task_line(t, mode), reply_markup=_build_task_row_kb(tid))
 
+@dp.callback_query(F.data.startswith("tasks:open"))
+async def tasks_open_cb(c: types.CallbackQuery):
+    # формати: tasks:open, tasks:open:1, tasks:today, tasks:overdue ...
+    parts = c.data.split(":")
+    mode = parts[1] if len(parts) > 1 else "open"
+    # якщо передали сторінку (":open:1"), її поки ігноруємо
+    mode = "open" if mode == "open" else mode
+
+    conn = await connect()
+    u = await get_user(conn, c.from_user.id)
+    await conn.close()
+    bx_id = u["bitrix_user_id"] if u else None
+    if not bx_id:
+        await c.answer("Спочатку прив’яжіть Bitrix: /bind email", show_alert=True)
+        return
+
+    now = dt.datetime.now(KYIV_TZ)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
+
+    extra = {"!STATUS": 5}
+    header = "Відкриті завдання"
+    if mode in ("today","сьогодні"):
+        extra = {">=DEADLINE": day_start.isoformat(), "<=DEADLINE": day_end.isoformat()}
+        header = "Завдання на сьогодні"
+    elif mode in ("overdue","прострочені","over"):
+        extra = {"<DEADLINE": now.isoformat(), "!STATUS": 5}
+        header = "Прострочені завдання"
+    elif mode in ("closed_today","done_today"):
+        extra = {">=CLOSED_DATE": day_start.isoformat(), "<=CLOSED_DATE": day_end.isoformat()}
+        header = "Сьогодні закриті"
+
+    fields = ["ID","TITLE","DEADLINE","STATUS","CLOSED_DATE","RESPONSIBLE_ID","CREATED_BY","UF_CRM_TASK"]
+    filters = [
+        {"RESPONSIBLE_ID": bx_id, **extra},
+        {"ACCOMPLICE": bx_id, **extra},
+        {"AUDITOR": bx_id, **extra},
+        {"CREATED_BY": bx_id, **extra},
+    ]
+
+    bag = {}
+    for f in filters:
+        try:
+            res = list_tasks(f, fields)
+            arr = res.get("result") if isinstance(res, dict) else (res or [])
+            for t in arr:
+                tid = str(t.get("ID") or t.get("id"))
+                if tid and tid not in bag:
+                    bag[tid] = t
+        except Exception:
+            pass
+
+    tasks = list(bag.values())
+
+    # відповідаємо на callback, щоб прибрати «крутилку»
+    await c.answer()
+
+    if not tasks:
+        # редагуємо заголовок, або шлемо нове повідомлення
+        try:
+            await c.message.edit_text("Задач за запитом не знайдено 🙂")
+        except TelegramBadRequest:
+            await bot.send_message(c.message.chat.id, "Задач за запитом не знайдено 🙂")
+        return
+
+    # редагуємо поточне повідомлення заголовком
+    try:
+        await c.message.edit_text(f"{header} (до 20):")
+    except TelegramBadRequest:
+        await bot.send_message(c.message.chat.id, f"{header} (до 20):")
+
+    # шлемо карточки з кнопками
+    for t in tasks[:20]:
+        tid = int(t.get("ID") or t.get("id"))
+        await bot.send_message(
+            c.message.chat.id,
+            _task_line(t, mode),
+            reply_markup=_build_task_row_kb(tid)
+        )
+
 
 # ======== CALLBACKS: details / done ========
 
