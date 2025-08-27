@@ -8,6 +8,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
+from starlette import status
 
 from shared.settings import settings
 from shared.team_names import TEAMS
@@ -223,9 +224,13 @@ async def report_now(m: types.Message):
     await m.answer("Звіт відправлено в майстер-групу ✅")
 
 
-# ---- FastAPI webhook
-@app.post(f"/webhook/{settings.WEBHOOK_SECRET}")
-async def telegram_webhook(request: Request):
+# ---- FastAPI webhook (динамічний шлях з перевіркою секрету)
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret.strip() != settings.WEBHOOK_SECRET.strip():
+        # маскуємося під 404, щоб не світити ендпоінт
+        return JSONResponse({"ok": False}, status_code=status.HTTP_404_NOT_FOUND)
+
     update = types.Update.model_validate(await request.json(), context={"bot": bot})
     try:
         await dp.feed_update(bot, update)
@@ -237,13 +242,16 @@ async def telegram_webhook(request: Request):
 
 @app.on_event("startup")
 async def on_startup():
+    # 1) БД та seed
     await ensure_schema_and_seed()
 
+    # 2) Реєструємо Telegram webhook
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(
         url=f"{settings.WEBHOOK_BASE}/webhook/{settings.WEBHOOK_SECRET}",
         allowed_updates=["message", "callback_query"],
     )
 
+    # 3) Планувальник звітів у цьому процесі (якщо RUN_WORKER_IN_APP=1)
     if getattr(settings, "RUN_WORKER_IN_APP", False):
         asyncio.create_task(daily_loop())
