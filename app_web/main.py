@@ -1,6 +1,7 @@
 # app_web/main.py
 import os
 import json
+import math
 import asyncio
 import datetime as dt
 from typing import Optional
@@ -60,13 +61,10 @@ async def _resolve_team_stage_id(team_id: int) -> str:
         return ""
     tn = _normalize(team_name)
     for st in stages:
-        name = st.get("NAME") or st.get("name") or ""
-        code = st.get("STATUS_ID") or st.get("STATUSID") or st.get("ID") or st.get("id")
+        name = (st.get("NAME") or st.get("name") or "")
+        code = (st.get("STATUS_ID") or st.get("STATUSID") or st.get("ID") or st.get("id"))
         nrm = _normalize(name)
-        if tn in nrm:
-            return str(code)
-        # sometimes "brigada" transliteration
-        if tn.replace("бригада", "brigada") in nrm:
+        if tn in nrm or tn.replace("бригада", "brigada") in nrm:
             return str(code)
     return ""
 
@@ -86,7 +84,7 @@ async def start(m: types.Message):
 
     if row and row["team_id"]:
         kb = InlineKeyboardBuilder()
-        kb.button(text="📋 Мої задачі", callback_data="tasks:open:open")
+        kb.button(text="📋 Мої задачі", callback_data="tasks:list:open:1")
         kb.button(text="🔁 Змінити бригаду", callback_data="team:change")
         kb.adjust(1, 1)
         await m.answer(
@@ -125,7 +123,7 @@ async def team_set(c: types.CallbackQuery):
 
     text = f"Бригаду встановлено: *{TEAMS.get(tid, '—')}*. Готово ✅"
     kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Мої задачі", callback_data="tasks:open:open")
+    kb.button(text="📋 Мої задачі", callback_data="tasks:list:open:1")
     with suppress(Exception):
         await c.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb.as_markup())
     await c.answer("Збережено ✅", show_alert=False)
@@ -165,6 +163,8 @@ async def bind_email(m: types.Message):
 
 
 # ========= TASKS (helpers) =========
+PAGE_SIZE = 8
+
 def _extract_deal_id_from_task(task: dict) -> Optional[int]:
     cand = task.get("UF_CRM_TASK") or task.get("ufCrmTask") or []
     if isinstance(cand, str):
@@ -222,122 +222,103 @@ def _task_line(t: dict, mode: str) -> str:
     extra_s = f" ({status_txt})" if status_txt and mode not in ("closed_today",) else ""
     return f"• #{tid}: {title}{suffix}{extra_s}"
 
-def _build_task_row_kb(tid: int) -> types.InlineKeyboardMarkup:
+def _mode_header(mode: str) -> str:
+    return {
+        "today": "Завдання на сьогодні",
+        "overdue": "Прострочені завдання",
+        "closed_today": "Сьогодні закриті",
+        "open": "Відкриті завдання",
+    }.get(mode, "Завдання")
+
+def _render_tasks_page(tasks: list[dict], page: int, mode: str) -> str:
+    total = len(tasks)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(1, min(page, pages))
+    start = (page - 1) * PAGE_SIZE
+    chunk = tasks[start:start + PAGE_SIZE]
+
+    lines = [f"{_mode_header(mode)} (стор. {page}/{pages}, всього: {total})"]
+    for t in chunk:
+        lines.append(_task_line(t, mode))
+    return "\n".join(lines)
+
+def _tasks_nav_kb(mode: str, page: int, total: int) -> types.InlineKeyboardMarkup:
+    pages = max(1, math.ceil(max(0, total) / PAGE_SIZE))
+    page = max(1, min(page, pages))
+    prev_p = max(1, page - 1)
+    next_p = min(pages, page + 1)
+
     kb = InlineKeyboardBuilder()
-    kb.button(text="ℹ️ Деталі", callback_data=f"task:details:{tid}")
-    kb.button(text="✅ Закрити", callback_data=f"task:done:{tid}")
-    kb.adjust(2)
+    # пагінація
+    kb.button(text="◀️", callback_data=f"tasks:list:{mode}:{prev_p}")
+    kb.button(text="▶️", callback_data=f"tasks:list:{mode}:{next_p}")
+    # фільтри
+    kb.button(text="🗓 Сьогодні", callback_data="tasks:list:today:1")
+    kb.button(text="⏰ Прострочені", callback_data="tasks:list:overdue:1")
+    kb.button(text="🟢 Відкриті", callback_data="tasks:list:open:1")
+    kb.button(text="🔄 Оновити", callback_data=f"tasks:list:{mode}:{page}")
+    kb.adjust(2, 2, 2)
     return kb.as_markup()
 
 
 # ========= TASKS (commands & callbacks) =========
 @dp.message(Command("tasks"))
 async def my_tasks(m: types.Message):
-    # /tasks [open|today|overdue|closed_today]
-    args = (m.text or "").split()[1:]
-    mode = (args[0] if args else "open").lower()
+    # просто відкриваємо список з дефолтним режимом
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Відкрити список", callback_data="tasks:list:open:1")
+    await m.answer("Натисніть, щоб побачити список задач:", reply_markup=kb.as_markup())
 
-    conn = await connect()
-    u = await get_user(conn, m.from_user.id)
-    await conn.close()
-    bx_id = u["bitrix_user_id"] if u else None
-    if not bx_id:
-        await m.answer("Спочатку прив’яжіть Bitrix e-mail: `/bind user@company.com`", parse_mode=ParseMode.MARKDOWN)
-        return
 
-    now = dt.datetime.now(KYIV_TZ)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
-
-    extra = {}
-    header = "Відкриті завдання"
-    if mode in ("today","сьогодні"):
-        extra = {">=DEADLINE": day_start.isoformat(), "<=DEADLINE": day_end.isoformat()}
-        header = "Завдання на сьогодні"
-    elif mode in ("overdue","прострочені","over"):
-        extra = {"<DEADLINE": now.isoformat(), "!STATUS": 5}
-        header = "Прострочені завдання"
-    elif mode in ("closed_today","done_today"):
-        extra = {">=CLOSED_DATE": day_start.isoformat(), "<=CLOSED_DATE": day_end.isoformat()}
-        header = "Сьогодні закриті"
-    else:
-        extra = {"!STATUS": 5}
-
-    fields = ["ID","TITLE","DEADLINE","STATUS","CLOSED_DATE","RESPONSIBLE_ID","CREATED_BY","UF_CRM_TASK"]
-    filters = [
-        {"RESPONSIBLE_ID": bx_id, **extra},
-        {"ACCOMPLICE": bx_id, **extra},
-        {"AUDITOR": bx_id, **extra},
-        {"CREATED_BY": bx_id, **extra},
-    ]
-
-    bag = {}
-    for f in filters:
-        try:
-            res = list_tasks(f, fields)
-            arr = res.get("result") if isinstance(res, dict) else (res or [])
-            for t in arr:
-                tid = str(t.get("ID") or t.get("id"))
-                if tid and tid not in bag:
-                    bag[tid] = t
-        except Exception:
-            pass
-
-    tasks = list(bag.values())
-    if not tasks:
-        await m.answer("Задач за запитом не знайдено 🙂")
-        return
-
-    await m.answer(f"{header} (до 20):")
-    for t in tasks[:20]:
-        tid = int(t.get("ID") or t.get("id"))
-        await m.answer(_task_line(t, mode), reply_markup=_build_task_row_kb(tid))
+@dp.callback_query(F.data.startswith("tasks:list:"))
+async def tasks_list_cb(c: types.CallbackQuery):
+    with suppress(Exception):
+        await c.answer()
+    parts = c.data.split(":")  # tasks:list:<mode>:<page>
+    mode = parts[2] if len(parts) > 2 else "open"
+    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+    await _show_tasks_page(c.message.chat.id, mode, page, edit_message=c.message)
 
 
 @dp.callback_query(F.data.startswith("tasks:open"))
 async def tasks_open_cb(c: types.CallbackQuery):
-    # fast answer to avoid "query is too old"
+    # backward compatibility з старою кнопкою
     with suppress(Exception):
         await c.answer()
-
     with suppress(TelegramBadRequest):
         await c.message.edit_text("📦 Завантажую задачі…")
+    await _show_tasks_page(c.message.chat.id, "open", 1, edit_message=c.message)
 
+
+async def _show_tasks_page(chat_id: int, mode: str, page: int, edit_message: Optional[types.Message] = None):
+    # 1) get user & bx id
     conn = await connect()
-    u = await get_user(conn, c.from_user.id)
-    await conn.close()
+    try:
+        u = await get_user(conn, chat_id)   # приватні чати: tg_user_id == chat_id
+    finally:
+        await conn.close()
+
     bx_id = u["bitrix_user_id"] if u else None
     if not bx_id:
-        await bot.send_message(c.message.chat.id, "Спочатку прив’яжіть Bitrix: /bind email")
+        await bot.send_message(chat_id, "Спочатку прив’яжіть Bitrix: /bind email")
         return
 
-    # mode parsing (supports tasks:open:open | tasks:open:today | tasks:open:overdue ...)
-    parts = c.data.split(":")
-    mode = parts[2] if len(parts) >= 3 else "open"
-
+    # 2) filters by mode
     now = dt.datetime.now(KYIV_TZ)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
 
     extra = {"!STATUS": 5}
-    header = "Відкриті завдання"
     if mode in ("today","сьогодні"):
         extra = {">=DEADLINE": day_start.isoformat(), "<=DEADLINE": day_end.isoformat()}
-        header = "Завдання на сьогодні"
     elif mode in ("overdue","прострочені","over"):
         extra = {"<DEADLINE": now.isoformat(), "!STATUS": 5}
-        header = "Прострочені завдання"
     elif mode in ("closed_today","done_today"):
         extra = {">=CLOSED_DATE": day_start.isoformat(), "<=CLOSED_DATE": day_end.isoformat()}
-        header = "Сьогодні закриті"
 
-    fields = ["ID","TITLE","DEADLINE","STATUS","CLOSED_DATE","RESPONSIBLE_ID","CREATED_BY","UF_CRM_TASK"]
-    filters = [
-        {"RESPONSIBLE_ID": bx_id, **extra},
-        {"ACCOMPLICE": bx_id, **extra},
-        {"AUDITOR": bx_id, **extra},
-        {"CREATED_BY": bx_id, **extra},
-    ]
+    fields = ["ID","TITLE","DEADLINE","STATUS","UF_CRM_TASK"]
+    # беремо лише RESPONSIBLE_ID — менше дублів і менше даних
+    filters = [{"RESPONSIBLE_ID": bx_id, **extra}]
 
     bag = {}
     for f in filters:
@@ -352,23 +333,14 @@ async def tasks_open_cb(c: types.CallbackQuery):
             pass
 
     tasks = list(bag.values())
+    text = _render_tasks_page(tasks, page, mode)
+    kb = _tasks_nav_kb(mode, page, len(tasks))
 
-    if not tasks:
+    if edit_message:
         with suppress(TelegramBadRequest):
-            await c.message.edit_text("Задач за запитом не знайдено 🙂")
-        return
-
-    with suppress(TelegramBadRequest):
-        await c.message.edit_text(f"{header} (до 20):")
-
-    for t in tasks[:20]:
-        tid = int(t.get("ID") or t.get("id"))
-        await bot.send_message(
-            c.message.chat.id,
-            _task_line(t, mode),
-            reply_markup=_build_task_row_kb(tid)
-        )
-        await asyncio.sleep(0.03)  # маленький троттл
+            await edit_message.edit_text(text, reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, text, reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("task:details:"))
@@ -395,7 +367,7 @@ async def task_details(c: types.CallbackQuery):
 
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ Закрити", callback_data=f"task:done:{tid}")
-        kb.button(text="🔙 До списку", callback_data="tasks:open:open")
+        kb.button(text="🔙 До списку", callback_data="tasks:list:open:1")
         kb.adjust(2)
 
         with suppress(TelegramBadRequest):
@@ -552,7 +524,6 @@ async def telegram_webhook(secret: str, request: Request):
         valid.add(OLD_SECRET)
 
     if secret.strip() not in valid:
-        # діагностика при 404 секреті
         print("[webhook] WRONG SECRET got:", secret, "| expected one of:", list(valid))
         return JSONResponse({"ok": False}, status_code=status.HTTP_404_NOT_FOUND)
 
