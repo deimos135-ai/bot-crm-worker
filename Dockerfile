@@ -9,5 +9,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# web процес за замовчуванням
+# web-процес за замовчуванням
 CMD ["uvicorn", "app_web.main:app", "--host", "0.0.0.0", "--port", "8080"]
