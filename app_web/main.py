@@ -26,7 +26,10 @@ from shared.bx import (
     get_deal, get_deal_products, get_deal_contacts, get_contact
 )
 from worker.report_worker import daily_loop, build_full_report
+from app_web.team_handlers import router as team_router
 
+# ... після ініціалізації dp/dispatcher:
+dp.include_router(team_router)
 
 # ------------- Deals env
 DEAL_CATEGORY_ID = int(os.getenv("DEAL_CATEGORY_ID", "0") or 0)
