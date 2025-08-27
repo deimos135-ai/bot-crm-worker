@@ -227,7 +227,7 @@ def _mode_header(mode: str) -> str:
         "today": "Завдання на сьогодні",
         "overdue": "Прострочені завдання",
         "closed_today": "Сьогодні закриті",
-        "open": "Відкриті завдання",
+        "open": "Активні задачі",
     }.get(mode, "Завдання")
 
 def _render_tasks_page(tasks: list[dict], page: int, mode: str) -> str:
@@ -286,7 +286,7 @@ async def tasks_open_cb(c: types.CallbackQuery):
     with suppress(Exception):
         await c.answer()
     with suppress(TelegramBadRequest):
-        await c.message.edit_text("📦 Завантажую задачі…")
+        await c.message.edit_text("📦 Завантажую …")
     await _show_tasks_page(c.message.chat.id, "open", 1, edit_message=c.message)
 
 
@@ -308,14 +308,16 @@ async def _show_tasks_page(chat_id: int, mode: str, page: int, edit_message: Opt
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
 
-    extra = {"!STATUS": 5}
-    if mode in ("today","сьогодні"):
-        extra = {">=DEADLINE": day_start.isoformat(), "<=DEADLINE": day_end.isoformat()}
-    elif mode in ("overdue","прострочені","over"):
-        extra = {"<DEADLINE": now.isoformat(), "!STATUS": 5}
-    elif mode in ("closed_today","done_today"):
-        extra = {">=CLOSED_DATE": day_start.isoformat(), "<=CLOSED_DATE": day_end.isoformat()}
-
+# стало — дефолт: усі активні (жива колонка Bitrix)
+if mode in ("today","сьогодні"):
+    extra = {">=DEADLINE": day_start.isoformat(), "<=DEADLINE": day_end.isoformat()}
+elif mode in ("overdue","прострочені","over"):
+    extra = {"<DEADLINE": now.isoformat(), "!STATUS": 5}
+elif mode in ("closed_today","done_today"):
+    extra = {">=CLOSED_DATE": day_start.isoformat(), "<=CLOSED_DATE": day_end.isoformat()}
+else:
+    extra = {"REAL_STATUS": 2}   # <-- головне: "активні" задачі
+    
     fields = ["ID","TITLE","DEADLINE","STATUS","UF_CRM_TASK"]
     # беремо лише RESPONSIBLE_ID — менше дублів і менше даних
     filters = [{"RESPONSIBLE_ID": bx_id, **extra}]
