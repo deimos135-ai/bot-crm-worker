@@ -1,3 +1,4 @@
+-- Не обов'язково виконувати вручну (код робить ensure), але залишаю для зручності.
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
   tg_user_id BIGINT UNIQUE NOT NULL,
@@ -10,8 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS teams (
   id INT PRIMARY KEY,
-  name TEXT NOT NULL,
-  lead_tg_chat_id BIGINT
+  name TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_actions (
