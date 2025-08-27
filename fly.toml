@@ -22,7 +22,6 @@ primary_region = "waw"
     timeout = "2s"
     grace_period = "10s"
 
-# Якщо матимете другу машину для воркера:
 [processes]
   app = "uvicorn app_web.main:app --host 0.0.0.0 --port 8080"
   worker = "python -m worker.report_worker"
