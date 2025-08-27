@@ -45,3 +45,16 @@ def comment_deal(deal_id: int, text: str):
         return call_bx("crm.timeline.comment.add", {"fields": {"ENTITY_TYPE": "deal", "ENTITY_ID": int(deal_id), "COMMENT": text}})
     except Exception:
         return call_bx("crm.deal.update", {"id": int(deal_id), "fields": {"COMMENTS": text}})
+# --- Task (get one) ---
+def get_task(task_id: int):
+    # дає повний об’єкт задачі (в т.ч. UF_CRM_TASK)
+    return call_bx("tasks.task.get", {"taskId": int(task_id)}).get("result", {}).get("task", {})
+
+# --- Deal (get one) ---
+def get_deal(deal_id: int):
+    return call_bx("crm.deal.get", {"id": int(deal_id)}).get("result", {})
+
+# --- Contact (get one) ---
+def get_contact(contact_id: int):
+    return call_bx("crm.contact.get", {"id": int(contact_id)}).get("result", {})
+
