@@ -156,7 +156,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
             if contact_phone else ""
         ),
         "",
-        f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
+        f"<a href=\"{link}\">Відкрити в CRM</a>",
     ]
     return f"<b>{head}</b>\n\n" + "\n".join(body_lines)
 
