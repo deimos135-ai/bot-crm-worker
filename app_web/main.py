@@ -5,7 +5,6 @@ import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -33,10 +32,6 @@ dp = Dispatcher()
 # ----------------------------- Bitrix helpers -----------------------------
 
 B24_BASE = settings.BITRIX_WEBHOOK_BASE.rstrip("/")
-# Витягуємо портал, щоб будувати лінки без settings.B24_DOMAIN
-_p = urlparse(B24_BASE)
-PORTAL_BASE = f"{_p.scheme}://{_p.netloc}"
-
 HTTP: aiohttp.ClientSession
 
 
@@ -50,6 +45,24 @@ async def b24(method: str, **params) -> Any:
         return data.get("result")
 
 
+# ----------------------------- Brigade stages ------------------------------
+
+# воронка CATEGORY_ID=20
+BRIGADE_STAGE_BY_NUM = {
+    1: "C20:UC_XF8O6V",  # Бригада №1
+    2: "C20:UC_0XLPCN",
+    3: "C20:UC_204CP3",
+    4: "C20:UC_TNEW3Z",
+    5: "C20:UC_RMBZ37",
+    7: "C20:7",          # Інші бригади
+}
+
+# ----------------------------- Runtime storage -----------------------------
+
+# у проді краще зберегти це в БД; зараз—в пам'яті процесу
+USER_BITRIX_ID: Dict[int, int] = {}   # telegram_user_id -> bitrix_user_id
+USER_BRIGADE: Dict[int, int] = {}     # telegram_user_id -> brigade number (1..5/7)
+
 # ----------------------------- Caches -------------------------------------
 
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
@@ -58,20 +71,19 @@ _ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None   # UF_CRM_1602756048 optionId
 
 async def get_deal_type_map() -> Dict[str, str]:
     """
-    Статуси-типи угод (ENTITY_ID=DEAL_TYPE). Адміни можуть перейменувати їх
-    під 'підключення/ремонт/аварія' тощо — тоді цей мапінг все відобразить.
+    Bitrix стандартні типи угод: crm.status.list(filter={"ENTITY_ID":"DEAL_TYPE"})
+    -> [{'STATUS_ID':'SALE','NAME':'Продаж'}, ...]
     """
     global _DEAL_TYPE_MAP
     if _DEAL_TYPE_MAP is None:
         items = await b24("crm.status.list", filter={"ENTITY_ID": "DEAL_TYPE"})
-        # items: [{STATUS_ID:'SALE', NAME:'Підключення'}, ...]
         _DEAL_TYPE_MAP = {i["STATUS_ID"]: i["NAME"] for i in items}
     return _DEAL_TYPE_MAP
 
 
 async def get_router_enum_map() -> Dict[str, str]:
     """
-    Знаходимо користувацьке поле UF_CRM_1602756048 і підтягуємо LIST-опції.
+    Знайти UF_CRM_1602756048 (тип роутера) через crm.deal.userfield.list та зібрати LIST.
     """
     global _ROUTER_ENUM_MAP
     if _ROUTER_ENUM_MAP is None:
@@ -80,7 +92,7 @@ async def get_router_enum_map() -> Dict[str, str]:
         options: Dict[str, str] = {}
         if uf and isinstance(uf.get("LIST"), list):
             for o in uf["LIST"]:
-                # o: {'ID': '5162', 'VALUE': 'TP-Link EC220-G5', ...}
+                # {'ID': '5162', 'VALUE': 'TP-Link EC220-G5', ...}
                 options[str(o["ID"])] = o["VALUE"]
         _ROUTER_ENUM_MAP = options
     return _ROUTER_ENUM_MAP
@@ -88,23 +100,20 @@ async def get_router_enum_map() -> Dict[str, str]:
 
 # ----------------------------- Formatting ----------------------------------
 
-# ЖОДНИХ <br> — тільки \n, щоб не ловити "Unsupported start tag 'br'"
-BR = "\n"
+BR = "\n"  # НЕ <br>, щоб Telegram HTML парсер не падав
 
 
 def _strip_bb(text: str) -> str:
-    """Bitrix comments may come with [p]...[/p] etc."""
+    """Bitrix comments можуть містити [p]...[/p]."""
     if not text:
         return ""
     t = re.sub(r"\[/?p\]", "", text, flags=re.I)
-    # інколи влітають <br> — гасимо їх у \n
-    t = t.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
     return t.strip()
 
 
 def _money_pair(val: Optional[str]) -> Optional[str]:
     """
-    Parse strings like '1700|UAH' -> '1700 UAH'
+    Розбір '1700|UAH' -> '1700 UAH'
     """
     if not val:
         return None
@@ -112,10 +121,6 @@ def _money_pair(val: Optional[str]) -> Optional[str]:
     if len(parts) == 2:
         return f"{parts[0]} {parts[1]}"
     return val
-
-
-def _deal_link(deal: Dict[str, Any]) -> str:
-    return f"{PORTAL_BASE}/crm/deal/details/{deal.get('ID')}/"
 
 
 async def render_deal_card(deal: Dict[str, Any]) -> str:
@@ -131,9 +136,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
 
     address = deal.get("UF_CRM_6009542BC647F") or "—"
 
-    router_id_val = deal.get("UF_CRM_1602756048")
-    # поле може бути числом або рядком — уніфікуємо до str, пустоту вважаємо «нема»
-    router_id = str(router_id_val) if router_id_val not in (None, "") else ""
+    router_id = str(deal.get("UF_CRM_1602756048") or "")  # '', '5162', ...
     router_name = router_map.get(router_id) if router_id else "—"
 
     router_price = _money_pair(deal.get("UF_CRM_1604468981320")) or "—"
@@ -147,7 +150,6 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
             c = await b24("crm.contact.get", id=deal["CONTACT_ID"])
             if c:
                 contact_name = f"{c.get('NAME', '')} {c.get('SECOND_NAME', '')} {c.get('LAST_NAME', '')}".strip() or "—"
-                # pick first phone
                 phones = c.get("PHONE") or []
                 if isinstance(phones, list) and phones:
                     contact_phone = phones[0].get("VALUE") or ""
@@ -155,7 +157,8 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
             log.warning("contact.get failed: %s", e)
 
     head = f"#{deal_id} • {html.escape(title)}"
-    link = _deal_link(deal)
+    link = f"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/"
+
     body_lines = [
         f"<b>Сума:</b> {html.escape(amount)}",
         "",
@@ -166,8 +169,9 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         f"<b>Вартість роутера:</b> {html.escape(router_price)}",
         f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
         "",
-        f"<b>Контакт:</b> {html.escape(contact_name)}"
-        + (f" • <a href=\"tel:{contact_phone}\">{html.escape(contact_phone)}</a>" if contact_phone else ""),
+        f"<b>Контакт:</b> {html.escape(contact_name)}" + (
+            f" • <a href=\"tel:{contact_phone}\">{html.escape(contact_phone)}</a>" if contact_phone else ""
+        ),
         "",
         f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
     ]
@@ -177,21 +181,29 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
 def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
     deal_id = str(deal.get("ID"))
     kb = [
-        [
-            InlineKeyboardButton(text="✅ Закрити угоду", callback_data=f"close:{deal_id}"),
-        ]
+        [InlineKeyboardButton(text="✅ Закрити угоду", callback_data=f"close:{deal_id}")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
 async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
-    await bot.send_message(
-        chat_id,
-        text,
-        reply_markup=deal_keyboard(deal),
-        disable_web_page_preview=True,  # щоб не рендерився прев’ю-линк
-    )
+    await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal))
+
+
+# ----------------------------- Bitrix users helpers ------------------------
+
+async def find_bitrix_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    """
+    Повертає першого знайденого користувача Bitrix по email (user.search).
+    """
+    try:
+        items = await b24("user.search", EMAIL=email)
+        if isinstance(items, list) and items:
+            return items[0]
+    except Exception as e:
+        log.warning("user.search failed: %s", e)
+    return None
 
 
 # ----------------------------- Handlers ------------------------------------
@@ -205,23 +217,92 @@ async def cmd_start(m: Message):
     await m.answer("Готові працювати ✅", reply_markup=kb)
 
 
+@dp.message(Command("bind"))
+async def cmd_bind(m: Message):
+    # /bind name@company.ua
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Вкажіть email: /bind name@company.ua")
+        return
+    email = parts[1].strip()
+    u = await find_bitrix_user_by_email(email)
+    if not u:
+        await m.answer("❌ Користувача з таким email не знайдено в Bitrix.")
+        return
+    try:
+        bx_id = int(u.get("ID"))
+    except Exception:
+        bx_id = None
+    if not bx_id:
+        await m.answer("❌ Не вдалося отримати Bitrix ID користувача.")
+        return
+
+    USER_BITRIX_ID[m.from_user.id] = bx_id
+    await m.answer(f"Прив’язано Bitrix ID: <b>{bx_id}</b> ✅")
+
+
+@dp.message(Command("whoami"))
+async def cmd_whoami(m: Message):
+    bx = USER_BITRIX_ID.get(m.from_user.id)
+    br = USER_BRIGADE.get(m.from_user.id)
+    msg = []
+    msg.append(f"Bitrix ID: <b>{bx}</b>" if bx else "Bitrix ID: не прив’язано")
+    msg.append(f"Бригада: <b>{br}</b>" if br else "Бригада: не обрано")
+    await m.answer("\n".join(msg))
+
+
+@dp.message(Command("set_brigade")))
+async def cmd_set_brigade(m: Message):
+    # /set_brigade 1
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await m.answer("Вкажіть номер бригади: /set_brigade 1")
+        return
+    bnum = int(parts[1].strip())
+    if bnum not in BRIGADE_STAGE_BY_NUM:
+        await m.answer(f"Невідома бригада {bnum}. Доступні: {', '.join(map(str, BRIGADE_STAGE_BY_NUM.keys()))}")
+        return
+    USER_BRIGADE[m.from_user.id] = bnum
+    await m.answer(f"Бригаду встановлено: <b>№{bnum}</b> ✅")
+
+
 @dp.callback_query(F.data == "my_deals")
 async def cb_my_deals(c: CallbackQuery):
-    # відповідаємо якнайшвидше, щоб не було "query is too old..."
+    # уникнути "query is too old..." – відповідаємо без затримки і ігноруємо виняток
     try:
         await c.answer(cache_time=5)
     except Exception:
         pass
 
-    # TODO: заміни на свій мапінг Telegram→Bitrix користувача
-    await c.message.answer("📦 Завантажую угоди бригади…")
+    uid = c.from_user.id
+    bx_id = USER_BITRIX_ID.get(uid)
+    bnum = USER_BRIGADE.get(uid)
+
+    if not bx_id:
+        await c.message.answer("Спершу прив’яжіть свій Bitrix email: /bind name@company.ua")
+        return
+    if not bnum:
+        await c.message.answer("Оберіть свою бригаду: /set_brigade 1")
+        return
+
+    stage_id = BRIGADE_STAGE_BY_NUM[bnum]
+    await c.message.answer(f"📦 Завантажую угоди для бригади №{bnum}…")
 
     deals: List[Dict[str, Any]] = await b24(
         "crm.deal.list",
-        filter={"CLOSED": "N"},
+        filter={
+            "STAGE_SEMANTIC_ID": "P",   # лише активні
+            "STAGE_ID": stage_id,       # саме стадія бригади
+            # "ASSIGNED_BY_ID": bx_id,  # розкоментуй, щоб бачити лише свої (персональні) у межах бригади
+        },
         order={"DATE_CREATE": "DESC"},
-        select=["*"]
+        select=["*"],
     )
+
+    if not deals:
+        await c.message.answer("Наразі немає відкритих угод у стадії вашої бригади.")
+        return
+
     for d in deals[:25]:
         await send_deal_card(c.message.chat.id, d)
 
@@ -240,11 +321,9 @@ async def deal_dump(m: Message):
         await m.answer("Не знайшов угоду.")
         return
 
-    # красиво відформатувати
     pretty = html.escape(json.dumps(deal, ensure_ascii=False, indent=2))
     await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>")
 
-    # і одразу картка
     await send_deal_card(m.chat.id, deal)
 
 
@@ -254,7 +333,6 @@ async def cb_close_deal(c: CallbackQuery):
         await c.answer(cache_time=5)
     except Exception:
         pass
-
     deal_id = c.data.split(":", 1)[1]
     deal = await b24("crm.deal.get", id=deal_id)
     if not deal:
@@ -264,7 +342,6 @@ async def cb_close_deal(c: CallbackQuery):
     target_stage = f"C{category}:WON"
     await b24("crm.deal.update", id=deal_id, fields={"STAGE_ID": target_stage})
     await c.message.answer(f"✅ Угоду #{deal_id} закрито у статусі WON.")
-    # оновлена картка
     deal2 = await b24("crm.deal.get", id=deal_id)
     await send_deal_card(c.message.chat.id, deal2)
 
@@ -278,7 +355,6 @@ async def on_startup():
 
     # реєстрація вебхука
     url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
-    log.info("[startup] portal base: %s", PORTAL_BASE)
     log.info("[startup] setting webhook to: %s", url)
     await bot.set_webhook(url)
 
