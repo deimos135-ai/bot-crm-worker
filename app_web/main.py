@@ -1,5 +1,4 @@
 # app_web/main.py
-import asyncio
 import html
 import json
 import logging
@@ -26,10 +25,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
 
 app = FastAPI()
-bot = Bot(
-    token=settings.BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ----------------------------- Bitrix helpers -----------------------------
@@ -44,16 +40,15 @@ async def b24(method: str, **params) -> Any:
     async with HTTP.post(url, json=params) as resp:
         data = await resp.json()
         if "error" in data:
-            raise RuntimeError(
-                f"B24 error: {data['error']}: {data.get('error_description')}"
-            )
+            raise RuntimeError(f"B24 error: {data['error']}: {data.get('error_description')}")
         return data.get("result")
 
 
 # ----------------------------- Caches -------------------------------------
 
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
-_ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None   # UF_CRM_1602756048 optionId -> text
+_ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1602756048 optionId -> text
+_TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1610558031277 optionId -> text
 
 
 async def get_deal_type_map() -> Dict[str, str]:
@@ -64,29 +59,34 @@ async def get_deal_type_map() -> Dict[str, str]:
     return _DEAL_TYPE_MAP
 
 
+async def _enum_map_for_userfield(field_name: str) -> Dict[str, str]:
+    fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
+    uf = next((f for f in fields if f.get("FIELD_NAME") == field_name), None)
+    options: Dict[str, str] = {}
+    if uf and isinstance(uf.get("LIST"), list):
+        for o in uf["LIST"]:
+            options[str(o["ID"])] = o["VALUE"]
+    return options
+
+
 async def get_router_enum_map() -> Dict[str, str]:
-    """Find custom userfield UF_CRM_1602756048 and get LIST options."""
     global _ROUTER_ENUM_MAP
     if _ROUTER_ENUM_MAP is None:
-        fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
-        uf = next(
-            (f for f in fields if f.get("FIELD_NAME") == "UF_CRM_1602756048"),
-            None
-        )
-        options = {}
-        if uf and isinstance(uf.get("LIST"), list):
-            for o in uf["LIST"]:
-                options[str(o["ID"])] = o["VALUE"]
-        _ROUTER_ENUM_MAP = options
+        _ROUTER_ENUM_MAP = await _enum_map_for_userfield("UF_CRM_1602756048")
     return _ROUTER_ENUM_MAP
+
+
+async def get_tariff_enum_map() -> Dict[str, str]:
+    global _TARIFF_ENUM_MAP
+    if _TARIFF_ENUM_MAP is None:
+        _TARIFF_ENUM_MAP = await _enum_map_for_userfield("UF_CRM_1610558031277")
+    return _TARIFF_ENUM_MAP
 
 
 # ----------------------------- Formatting ---------------------------------
 
-BR = "\n"
-
-
 def _strip_bb(text: str) -> str:
+    """Bitrix comments may come with [p]...[/p] etc."""
     if not text:
         return ""
     t = re.sub(r"\[/?p\]", "", text, flags=re.I)
@@ -94,6 +94,7 @@ def _strip_bb(text: str) -> str:
 
 
 def _money_pair(val: Optional[str]) -> Optional[str]:
+    """Parse strings like '1700|UAH' -> '1700 UAH'."""
     if not val:
         return None
     parts = str(val).split("|", 1)
@@ -105,80 +106,89 @@ def _money_pair(val: Optional[str]) -> Optional[str]:
 async def render_deal_card(deal: Dict[str, Any]) -> str:
     deal_type_map = await get_deal_type_map()
     router_map = await get_router_enum_map()
+    tariff_map = await get_tariff_enum_map()
 
     deal_id = deal.get("ID")
     title = deal.get("TITLE") or f"Deal #{deal_id}"
-    amount = f"{deal.get('OPPORTUNITY', '0.00')} {deal.get('CURRENCY_ID', 'UAH')}"
     type_code = deal.get("TYPE_ID") or ""
     type_name = deal_type_map.get(type_code, type_code or "—")
     category = deal.get("CATEGORY_ID", "—")
 
-    address = deal.get("UF_CRM_6009542BC647F") or "—"
+    # Адреса
+    address = (
+        deal.get("UF_CRM_6009542BC647F")
+        or deal.get("ADDRESS")
+        or "—"
+    )
 
+    # Роутер
     router_id = str(deal.get("UF_CRM_1602756048") or "")
     router_name = router_map.get(router_id) if router_id else "—"
-
     router_price = _money_pair(deal.get("UF_CRM_1604468981320")) or "—"
+
+    # Тариф
+    tariff_id = str(deal.get("UF_CRM_1610558031277") or "")
+    tariff_name = tariff_map.get(tariff_id) if tariff_id else "—"
+    tariff_price = _money_pair(deal.get("UF_CRM_1611652685839")) or "—"
+
+    # Підключення
+    install_price = _money_pair(deal.get("UF_CRM_1609868447208")) or "—"
+
     comments = _strip_bb(deal.get("COMMENTS") or "")
 
+    # Контакт
     contact_name = "—"
     contact_phone = ""
     if deal.get("CONTACT_ID"):
         try:
             c = await b24("crm.contact.get", id=deal["CONTACT_ID"])
             if c:
-                contact_name = (
-                    f"{c.get('NAME', '')} "
-                    f"{c.get('SECOND_NAME', '')} "
-                    f"{c.get('LAST_NAME', '')}"
-                ).strip() or "—"
+                contact_name = f"{c.get('NAME', '')} {c.get('SECOND_NAME', '')} {c.get('LAST_NAME', '')}".strip() or "—"
                 phones = c.get("PHONE") or []
                 if isinstance(phones, list) and phones:
                     contact_phone = phones[0].get("VALUE") or ""
         except Exception as e:
             log.warning("contact.get failed: %s", e)
 
-        head = f"#{deal_id} • {html.escape(title)}"
-    link = f"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/"
+    # Заголовок без посилань
+    head = f"#{deal_id} • {html.escape(title)}"
 
-    # Адреса: спочатку кастомне поле, потім стандартне
-    address_value = (
-        deal.get("UF_CRM_6009542BC647F")
-        or deal.get("ADDRESS")
-        or "—"
-    )
-
+    # Тіло без <a> і без <br> — лише \n
     body_lines = [
         f"<b>Тип угоди:</b> {html.escape(type_name)}",
         f"<b>Категорія:</b> {html.escape(str(category))}",
-        f"<b>Адреса:</b> {html.escape(address_value)}",
+        f"<b>Адреса:</b> {html.escape(address)}",
+        "",
+        f"<b>Тариф:</b> {html.escape(tariff_name)}",
+        f"<b>Вартість тарифу:</b> {html.escape(tariff_price)}",
+        "",
         f"<b>Роутер:</b> {html.escape(router_name)}",
         f"<b>Вартість роутера:</b> {html.escape(router_price)}",
+        f"<b>Вартість підключення:</b> {html.escape(install_price)}",
+        "",
         f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
         "",
-        f"<b>Контакт:</b> {html.escape(contact_name)}"
-        + (
-            f" • <a href=\"tel:{contact_phone}\">{html.escape(contact_phone)}</a>"
-            if contact_phone else ""
-        ),
+        f"<b>Контакт:</b> {html.escape(contact_name)}" + (f" • {html.escape(contact_phone)}" if contact_phone else ""),
         "",
-        f"<a href=\"{link}\">Відкрити в CRM</a>",
+        f"Bitrix24: crm/deal/details/{deal_id}/",
     ]
-
     return f"<b>{head}</b>\n\n" + "\n".join(body_lines)
 
 
 def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
     deal_id = str(deal.get("ID"))
-    kb = [
-        [InlineKeyboardButton(text="✅ Закрити угоду", callback_data=f"close:{deal_id}")]
-    ]
+    kb = [[InlineKeyboardButton(text="✅ Закрити угоду", callback_data=f"close:{deal_id}")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
 async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
-    await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal),disable_web_page_preview=True)
+    await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=deal_keyboard(deal),
+        disable_web_page_preview=True,
+    )
 
 
 # ----------------------------- Simple binding storage ----------------------
@@ -206,8 +216,10 @@ async def cmd_start(m: Message):
     )
     await m.answer(
         "Готові працювати ✅\n\n"
-        "Спочатку виконайте /bind ваш_email та /set_brigade 1..5",
-        reply_markup=kb
+        "Спочатку виконайте:\n"
+        "• /bind ваш_email\n"
+        "• /set_brigade 1..5",
+        reply_markup=kb,
     )
 
 
@@ -277,15 +289,18 @@ async def cb_my_deals(c: CallbackQuery):
         filter={"CLOSED": "N", "STAGE_ID": f"C20:{stage_code}"},
         order={"DATE_CREATE": "DESC"},
         select=[
-            # базові поля для картки
             "ID", "TITLE", "TYPE_ID", "CATEGORY_ID", "STAGE_ID",
             "COMMENTS", "CONTACT_ID",
-            # UF-поля, які потрібні у картці:
-            "UF_CRM_6009542BC647F",  # Адреса
-            "UF_CRM_1602756048",     # Роутер (enum id)
-            "UF_CRM_1604468981320",  # Вартість роутера
-            # якщо десь ще використовуєш суму/валюту — залиш; інакше можна прибрати:
-            "OPPORTUNITY", "CURRENCY_ID",
+            # Адреса
+            "UF_CRM_6009542BC647F",
+            # Роутер
+            "UF_CRM_1602756048",      # enum id
+            "UF_CRM_1604468981320",   # price
+            # Тариф
+            "UF_CRM_1610558031277",   # enum id
+            "UF_CRM_1611652685839",   # price
+            # Підключення
+            "UF_CRM_1609868447208",   # price
         ]
     )
 
@@ -293,10 +308,8 @@ async def cb_my_deals(c: CallbackQuery):
         await c.message.answer("Немає активних угод.")
         return
 
-    # Надсилаємо картки (у send_deal_card вже має бути disable_web_page_preview=True)
     for d in deals[:25]:
         await send_deal_card(c.message.chat.id, d)
-
 
 
 @dp.callback_query(F.data.startswith("close:"))
