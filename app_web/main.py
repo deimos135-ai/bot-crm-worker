@@ -203,10 +203,11 @@ async def cmd_start(m: Message):
     await m.answer(
         "Готові працювати ✅\n"
         "Команди:\n"
-        "• /bind <email> – прив’язати Bitrix користувача\n"
-        "• /set_brigade <1..5> – вибрати бригаду",
+        "• <code>/bind ваш_email@domain</code> – прив’язати Bitrix користувача\n"
+        "• <code>/set_brigade 1..5</code> – вибрати бригаду",
         reply_markup=kb
     )
+
 
 
 @dp.message(Command("bind"))
@@ -265,13 +266,14 @@ async def cb_my_deals(c: CallbackQuery):
 
     tg_id = c.from_user.id
     bind = USER_BINDINGS.get(tg_id)
-    if not bind or not bind.get("brigade"):
-        await c.message.answer(
-            "Спершу прив’яжіть акаунт і бригаду:\n"
-            "• /bind <email>\n"
-            "• /set_brigade <1..5>"
-        )
-        return
+   if not bind or not bind.get("brigade"):
+    await c.message.answer(
+        "Спершу прив’яжіть акаунт і бригаду:\n"
+        "• <code>/bind ваш_email@domain</code>\n"
+        "• <code>/set_brigade 1..5</code>"
+    )
+    return
+
 
     stage = BRIGADE_STAGE.get(bind["brigade"])
     await c.message.answer(f"📦 Завантажую угоди для бригади №{bind['brigade']}…")
