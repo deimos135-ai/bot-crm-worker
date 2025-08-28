@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -32,6 +33,10 @@ dp = Dispatcher()
 # ----------------------------- Bitrix helpers -----------------------------
 
 B24_BASE = settings.BITRIX_WEBHOOK_BASE.rstrip("/")
+# Витягуємо портал, щоб будувати лінки без settings.B24_DOMAIN
+_p = urlparse(B24_BASE)
+PORTAL_BASE = f"{_p.scheme}://{_p.netloc}"
+
 HTTP: aiohttp.ClientSession
 
 
@@ -52,23 +57,27 @@ _ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None   # UF_CRM_1602756048 optionId
 
 
 async def get_deal_type_map() -> Dict[str, str]:
+    """
+    Статуси-типи угод (ENTITY_ID=DEAL_TYPE). Адміни можуть перейменувати їх
+    під 'підключення/ремонт/аварія' тощо — тоді цей мапінг все відобразить.
+    """
     global _DEAL_TYPE_MAP
     if _DEAL_TYPE_MAP is None:
         items = await b24("crm.status.list", filter={"ENTITY_ID": "DEAL_TYPE"})
-        # items: [{ID:'SALE', NAME:'Продаж', ...}, ...]
+        # items: [{STATUS_ID:'SALE', NAME:'Підключення'}, ...]
         _DEAL_TYPE_MAP = {i["STATUS_ID"]: i["NAME"] for i in items}
     return _DEAL_TYPE_MAP
 
 
 async def get_router_enum_map() -> Dict[str, str]:
     """
-    Find custom userfield UF_CRM_1602756048 and get LIST options.
+    Знаходимо користувацьке поле UF_CRM_1602756048 і підтягуємо LIST-опції.
     """
     global _ROUTER_ENUM_MAP
     if _ROUTER_ENUM_MAP is None:
         fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
         uf = next((f for f in fields if f.get("FIELD_NAME") == "UF_CRM_1602756048"), None)
-        options = {}
+        options: Dict[str, str] = {}
         if uf and isinstance(uf.get("LIST"), list):
             for o in uf["LIST"]:
                 # o: {'ID': '5162', 'VALUE': 'TP-Link EC220-G5', ...}
@@ -79,7 +88,8 @@ async def get_router_enum_map() -> Dict[str, str]:
 
 # ----------------------------- Formatting ----------------------------------
 
-BR = "<br>"
+# ЖОДНИХ <br> — тільки \n, щоб не ловити "Unsupported start tag 'br'"
+BR = "\n"
 
 
 def _strip_bb(text: str) -> str:
@@ -87,6 +97,8 @@ def _strip_bb(text: str) -> str:
     if not text:
         return ""
     t = re.sub(r"\[/?p\]", "", text, flags=re.I)
+    # інколи влітають <br> — гасимо їх у \n
+    t = t.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
     return t.strip()
 
 
@@ -102,6 +114,10 @@ def _money_pair(val: Optional[str]) -> Optional[str]:
     return val
 
 
+def _deal_link(deal: Dict[str, Any]) -> str:
+    return f"{PORTAL_BASE}/crm/deal/details/{deal.get('ID')}/"
+
+
 async def render_deal_card(deal: Dict[str, Any]) -> str:
     deal_type_map = await get_deal_type_map()
     router_map = await get_router_enum_map()
@@ -115,7 +131,9 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
 
     address = deal.get("UF_CRM_6009542BC647F") or "—"
 
-    router_id = str(deal.get("UF_CRM_1602756048") or "")  # may be '', '5162', etc
+    router_id_val = deal.get("UF_CRM_1602756048")
+    # поле може бути числом або рядком — уніфікуємо до str, пустоту вважаємо «нема»
+    router_id = str(router_id_val) if router_id_val not in (None, "") else ""
     router_name = router_map.get(router_id) if router_id else "—"
 
     router_price = _money_pair(deal.get("UF_CRM_1604468981320")) or "—"
@@ -137,7 +155,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
             log.warning("contact.get failed: %s", e)
 
     head = f"#{deal_id} • {html.escape(title)}"
-    link = f"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/"
+    link = _deal_link(deal)
     body_lines = [
         f"<b>Сума:</b> {html.escape(amount)}",
         "",
@@ -148,7 +166,8 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         f"<b>Вартість роутера:</b> {html.escape(router_price)}",
         f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
         "",
-        f"<b>Контакт:</b> {html.escape(contact_name)}" + (f" • <a href=\"tel:{contact_phone}\">{html.escape(contact_phone)}</a>" if contact_phone else ""),
+        f"<b>Контакт:</b> {html.escape(contact_name)}"
+        + (f" • <a href=\"tel:{contact_phone}\">{html.escape(contact_phone)}</a>" if contact_phone else ""),
         "",
         f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
     ]
@@ -167,7 +186,12 @@ def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
-    await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal))
+    await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=deal_keyboard(deal),
+        disable_web_page_preview=True,  # щоб не рендерився прев’ю-линк
+    )
 
 
 # ----------------------------- Handlers ------------------------------------
@@ -183,11 +207,13 @@ async def cmd_start(m: Message):
 
 @dp.callback_query(F.data == "my_deals")
 async def cb_my_deals(c: CallbackQuery):
-    await c.answer()
-    user_id = c.from_user.id
+    # відповідаємо якнайшвидше, щоб не було "query is too old..."
+    try:
+        await c.answer(cache_time=5)
+    except Exception:
+        pass
 
     # TODO: заміни на свій мапінг Telegram→Bitrix користувача
-    # Поки що – просто віддаємо всі відкриті угоди по всій воронці (демо).
     await c.message.answer("📦 Завантажую угоди бригади…")
 
     deals: List[Dict[str, Any]] = await b24(
@@ -224,7 +250,11 @@ async def deal_dump(m: Message):
 
 @dp.callback_query(F.data.startswith("close:"))
 async def cb_close_deal(c: CallbackQuery):
-    await c.answer()
+    try:
+        await c.answer(cache_time=5)
+    except Exception:
+        pass
+
     deal_id = c.data.split(":", 1)[1]
     deal = await b24("crm.deal.get", id=deal_id)
     if not deal:
@@ -248,6 +278,7 @@ async def on_startup():
 
     # реєстрація вебхука
     url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
+    log.info("[startup] portal base: %s", PORTAL_BASE)
     log.info("[startup] setting webhook to: %s", url)
     await bot.set_webhook(url)
 
