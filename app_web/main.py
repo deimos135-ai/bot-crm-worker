@@ -83,7 +83,7 @@ async def get_router_enum_map() -> Dict[str, str]:
 
 # ----------------------------- Formatting ---------------------------------
 
-BR = "<br>"
+BR = "\n"
 
 
 def _strip_bb(text: str) -> str:
@@ -158,7 +158,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         "",
         f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
     ]
-    return f"<b>{head}</b>{BR*2}" + BR.join(body_lines)
+    return f"<b>{head}</b>\n\n" + "\n".join(body_lines)
 
 
 def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
