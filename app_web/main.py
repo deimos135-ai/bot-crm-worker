@@ -14,6 +14,9 @@ from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    BotCommand,
     Message,
     Update,
     CallbackQuery,
@@ -47,8 +50,8 @@ async def b24(method: str, **params) -> Any:
 # ----------------------------- Caches -------------------------------------
 
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
-_ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1602756048 optionId -> text
-_TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1610558031277 optionId -> text
+_ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None     # UF_CRM_1602756048 optionId -> text
+_TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None     # UF_CRM_1610558031277 optionId -> text
 
 
 async def get_deal_type_map() -> Dict[str, str]:
@@ -60,11 +63,13 @@ async def get_deal_type_map() -> Dict[str, str]:
 
 
 async def _enum_map_for_userfield(field_name: str) -> Dict[str, str]:
+    """Generic helper to fetch LIST options of a Deal UF enum."""
     fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
     uf = next((f for f in fields if f.get("FIELD_NAME") == field_name), None)
     options: Dict[str, str] = {}
     if uf and isinstance(uf.get("LIST"), list):
         for o in uf["LIST"]:
+            # o: {'ID': '5162', 'VALUE': 'TP-Link EC220-G5', ...}
             options[str(o["ID"])] = o["VALUE"]
     return options
 
@@ -85,6 +90,9 @@ async def get_tariff_enum_map() -> Dict[str, str]:
 
 # ----------------------------- Formatting ---------------------------------
 
+BR = "\n"
+
+
 def _strip_bb(text: str) -> str:
     """Bitrix comments may come with [p]...[/p] etc."""
     if not text:
@@ -94,13 +102,27 @@ def _strip_bb(text: str) -> str:
 
 
 def _money_pair(val: Optional[str]) -> Optional[str]:
-    """Parse strings like '1700|UAH' -> '1700 UAH'."""
+    """
+    Parse strings like '1700|UAH' -> '1700 UAH'
+    """
     if not val:
         return None
     parts = str(val).split("|", 1)
     if len(parts) == 2:
         return f"{parts[0]} {parts[1]}"
     return val
+
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📦 Мої угоди")],
+            [KeyboardButton(text="📋 Мої задачі")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        selective=False,
+    )
 
 
 async def render_deal_card(deal: Dict[str, Any]) -> str:
@@ -114,29 +136,24 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
     type_name = deal_type_map.get(type_code, type_code or "—")
     category = deal.get("CATEGORY_ID", "—")
 
-    # Адреса
-    address = (
-        deal.get("UF_CRM_6009542BC647F")
-        or deal.get("ADDRESS")
-        or "—"
-    )
+    # адреса з UF, якщо нема — стандартне поле ADDRESS
+    address_value = deal.get("UF_CRM_6009542BC647F") or deal.get("ADDRESS") or "—"
 
-    # Роутер
+    # роутер
     router_id = str(deal.get("UF_CRM_1602756048") or "")
     router_name = router_map.get(router_id) if router_id else "—"
     router_price = _money_pair(deal.get("UF_CRM_1604468981320")) or "—"
 
-    # Тариф
+    # тариф (enum + price)
     tariff_id = str(deal.get("UF_CRM_1610558031277") or "")
     tariff_name = tariff_map.get(tariff_id) if tariff_id else "—"
     tariff_price = _money_pair(deal.get("UF_CRM_1611652685839")) or "—"
 
-    # Підключення
+    # підключення (ціна)
     install_price = _money_pair(deal.get("UF_CRM_1609868447208")) or "—"
 
     comments = _strip_bb(deal.get("COMMENTS") or "")
 
-    # Контакт
     contact_name = "—"
     contact_phone = ""
     if deal.get("CONTACT_ID"):
@@ -150,29 +167,33 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         except Exception as e:
             log.warning("contact.get failed: %s", e)
 
-    # Заголовок без посилань
     head = f"#{deal_id} • {html.escape(title)}"
+    link = f"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/"
 
-    # Тіло без <a> і без <br> — лише \n
+    # телефону не робимо <a href="tel:"> — Telegram сам зробить клікабельним
+    contact_line = f"<b>Контакт:</b> {html.escape(contact_name)}"
+    if contact_phone:
+        contact_line += f" • {html.escape(contact_phone)}"
+
     body_lines = [
         f"<b>Тип угоди:</b> {html.escape(type_name)}",
         f"<b>Категорія:</b> {html.escape(str(category))}",
-        f"<b>Адреса:</b> {html.escape(address)}",
-        "",
-        f"<b>Тариф:</b> {html.escape(tariff_name)}",
-        f"<b>Вартість тарифу:</b> {html.escape(tariff_price)}",
+        f"<b>Адреса:</b> {html.escape(address_value)}",
         "",
         f"<b>Роутер:</b> {html.escape(router_name)}",
         f"<b>Вартість роутера:</b> {html.escape(router_price)}",
+        "",
+        f"<b>Тариф:</b> {html.escape(tariff_name)}",
+        f"<b>Вартість тарифу:</b> {html.escape(tariff_price)}",
         f"<b>Вартість підключення:</b> {html.escape(install_price)}",
         "",
         f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
         "",
-        f"<b>Контакт:</b> {html.escape(contact_name)}" + (f" • {html.escape(contact_phone)}" if contact_phone else ""),
+        contact_line,
         "",
-        f"Bitrix24: crm/deal/details/{deal_id}/",
+        f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
     ]
-    return f"<b>{head}</b>\n\n" + "\n".join(body_lines)
+    return f"<b>{head}</b>{BR*2}" + BR.join(body_lines)
 
 
 def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -187,7 +208,7 @@ async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
         chat_id,
         text,
         reply_markup=deal_keyboard(deal),
-        disable_web_page_preview=True,
+        disable_web_page_preview=True,  # прибирає прев’ю посилань
     )
 
 
@@ -208,64 +229,65 @@ async def set_binding(user_id: int, email: str, brigade: Optional[int] = None):
 
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Мої задачі", callback_data="tasks")],
-            [InlineKeyboardButton(text="📦 Мої угоди", callback_data="my_deals")],
-        ]
-    )
     await m.answer(
         "Готові працювати ✅\n\n"
         "Спочатку виконайте:\n"
         "• /bind ваш_email\n"
         "• /set_brigade 1..5",
-        reply_markup=kb,
+        reply_markup=main_menu_kb(),
     )
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(m: Message):
+    await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
 
 
 @dp.message(Command("bind"))
 async def cmd_bind(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await m.answer("Вкажіть email: /bind ваш_email")
+        await m.answer("Вкажіть email: /bind ваш_email", reply_markup=main_menu_kb())
         return
     email = parts[1].strip()
     await set_binding(m.from_user.id, email=email)
-    await m.answer(f"Прив’язано email: <code>{html.escape(email)}</code> ✅")
+    await m.answer(f"Прив’язано email: <code>{html.escape(email)}</code> ✅", reply_markup=main_menu_kb())
 
 
 @dp.message(Command("set_brigade"))
 async def cmd_set_brigade(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await m.answer("Вкажіть номер бригади: /set_brigade 1")
+        await m.answer("Вкажіть номер бригади: /set_brigade 1", reply_markup=main_menu_kb())
         return
     try:
         brigade = int(parts[1])
     except ValueError:
-        await m.answer("Номер має бути числом: 1..5")
+        await m.answer("Номер має бути числом: 1..5", reply_markup=main_menu_kb())
         return
 
     bind = await get_binding(m.from_user.id)
     if not bind:
-        await m.answer("Спершу виконайте /bind ваш_email")
+        await m.answer("Спершу виконайте /bind ваш_email", reply_markup=main_menu_kb())
         return
 
     bind["brigade"] = brigade
-    await m.answer(f"✅ Прив’язано до бригади №{brigade}")
+    await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
 
 
-@dp.callback_query(F.data == "my_deals")
-async def cb_my_deals(c: CallbackQuery):
-    await c.answer()
-    user_id = c.from_user.id
+# Текстова кнопка «📦 Мої угоди»
+@dp.message(F.text == "📦 Мої угоди")
+async def msg_my_deals(m: Message):
+    # Віддзеркалюємо логіку з callback
+    user_id = m.from_user.id
     bind = await get_binding(user_id)
 
     if not bind or not bind.get("brigade"):
-        await c.message.answer(
+        await m.answer(
             "Спершу прив’яжіть акаунт і бригаду:\n"
             "• /bind ваш_email\n"
-            "• /set_brigade 1..5"
+            "• /set_brigade 1..5",
+            reply_markup=main_menu_kb(),
         )
         return
 
@@ -279,10 +301,10 @@ async def cb_my_deals(c: CallbackQuery):
     }.get(brigade)
 
     if not stage_code:
-        await c.message.answer("Невірний номер бригади.")
+        await m.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
         return
 
-    await c.message.answer(f"📦 Завантажую угоди для бригади №{brigade}…")
+    await m.answer(f"📦 Завантажую угоди для бригади №{brigade}…", reply_markup=main_menu_kb())
 
     deals: List[Dict[str, Any]] = await b24(
         "crm.deal.list",
@@ -291,25 +313,57 @@ async def cb_my_deals(c: CallbackQuery):
         select=[
             "ID", "TITLE", "TYPE_ID", "CATEGORY_ID", "STAGE_ID",
             "COMMENTS", "CONTACT_ID",
-            # Адреса
-            "UF_CRM_6009542BC647F",
-            # Роутер
-            "UF_CRM_1602756048",      # enum id
-            "UF_CRM_1604468981320",   # price
-            # Тариф
-            "UF_CRM_1610558031277",   # enum id
-            "UF_CRM_1611652685839",   # price
-            # Підключення
-            "UF_CRM_1609868447208",   # price
-        ]
+            # адреса
+            "UF_CRM_6009542BC647F", "ADDRESS",
+            # роутер
+            "UF_CRM_1602756048",     # enum id
+            "UF_CRM_1604468981320",  # price
+            # тариф
+            "UF_CRM_1610558031277",  # enum id
+            "UF_CRM_1611652685839",  # price
+            # підключення (ціна)
+            "UF_CRM_1609868447208",
+        ],
     )
 
     if not deals:
-        await c.message.answer("Немає активних угод.")
+        await m.answer("Немає активних угод.", reply_markup=main_menu_kb())
         return
 
     for d in deals[:25]:
-        await send_deal_card(c.message.chat.id, d)
+        await send_deal_card(m.chat.id, d)
+
+
+@dp.callback_query(F.data == "my_deals")
+async def cb_my_deals(c: CallbackQuery):
+    await c.answer()
+    # тримаємо для сумісності (якщо десь ще є інлайн-кнопка)
+    m = c.message
+    await msg_my_deals(m)
+
+
+@dp.message(F.text == "📋 Мої задачі")
+async def msg_tasks(m: Message):
+    await m.answer("Задачі ще в розробці 🛠️", reply_markup=main_menu_kb())
+
+
+@dp.message(Command("deal_dump"))
+async def deal_dump(m: Message):
+    # /deal_dump 1109122  або /deal_dump #1109122
+    mtext = (m.text or "").strip()
+    m2 = re.search(r"(\d+)", mtext)
+    if not m2:
+        await m.answer("Вкажіть ID угоди: /deal_dump 12345", reply_markup=main_menu_kb())
+        return
+    deal_id = m2.group(1)
+    deal = await b24("crm.deal.get", id=deal_id)
+    if not deal:
+        await m.answer("Не знайшов угоду.", reply_markup=main_menu_kb())
+        return
+
+    pretty = html.escape(json.dumps(deal, ensure_ascii=False, indent=2))
+    await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>", reply_markup=main_menu_kb())
+    await send_deal_card(m.chat.id, deal)
 
 
 @dp.callback_query(F.data.startswith("close:"))
@@ -334,6 +388,17 @@ async def cb_close_deal(c: CallbackQuery):
 async def on_startup():
     global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+    # Команди бота (видимі у Bot Menu)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Почати"),
+        BotCommand(command="menu", description="Показати меню"),
+        BotCommand(command="bind", description="Прив’язати email"),
+        BotCommand(command="set_brigade", description="Вибрати бригаду"),
+        BotCommand(command="deal_dump", description="Показати dump угоди"),
+    ])
+
+    # Реєстрація вебхука
     url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
     log.info("[startup] setting webhook to: %s", url)
     await bot.set_webhook(url)
