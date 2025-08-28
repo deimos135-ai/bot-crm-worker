@@ -510,44 +510,31 @@ async def deals_for_team(m: types.Message):
     )
 
 
-# ===================== DIAGNOSTИКА ПОЛІВ УГОДИ =====================
-# ========= DEBUG: raw deal dump =========
-from html import escape  # залишимо, якщо знадобиться в майбутньому
 
+# ========= DEBUG: /deal_dump (raw JSON of a deal) =========
 @dp.message(Command("deal_dump"))
 async def deal_dump(m: types.Message):
     parts = (m.text or "").split()
-    if len(parts) < 2:
+    if len(parts) != 2 or not parts[1].isdigit():
         await m.answer("Приклад: `/deal_dump 1109122`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    raw = parts[1].lstrip("#")
-    if not raw.isdigit():
-        await m.answer("ID має бути числовим, напр.: `/deal_dump 1109122`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    deal_id = int(raw)
-
+    deal_id = int(parts[1])
     try:
-        d = get_deal(deal_id) or {}
+        deal = get_deal(deal_id) or {}
     except Exception as e:
-        await m.answer(f"Помилка отримання угоди: {e!s}")
+        await m.answer(f"Не вдалося отримати угоду: {e!s}")
         return
 
-    # Формуємо читаємий JSON з відступами
-    try:
-        pretty = json.dumps(d, ensure_ascii=False, indent=2)
-    except Exception:
-        pretty = str(d)
+    # гарно відформатований JSON
+    text = json.dumps(deal, ensure_ascii=False, indent=2)
 
-    # Ріжемо на шматки < 3500 символів (з невеликим запасом)
-    max_len = 3500
-    start = 0
-    while start < len(pretty):
-        chunk = pretty[start:start + max_len]
-        start += max_len
-        # ВАЖЛИВО: без жодного parse_mode, щоби Telegram не намагався парсити Markdown/HTML
-        await m.answer(chunk)  # parse_mode=None за замовчуванням
+    # Telegram ліміт + відсутність markdown, аби не ламалось на символах типу '*'
+    CHUNK = 3500
+    for i in range(0, len(text), CHUNK):
+        chunk = text[i:i + CHUNK]
+        # ВАЖЛИВО: без parse_mode, інакше markdown сприйме * _ [ ] і впаде
+        await m.answer(chunk, parse_mode=None)
 
 
 
