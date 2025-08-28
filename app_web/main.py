@@ -266,20 +266,37 @@ async def cb_my_deals(c: CallbackQuery):
         5: "UC_RMBZ37",
     }.get(brigade)
 
+    if not stage_code:
+        await c.message.answer("Невірний номер бригади.")
+        return
+
     await c.message.answer(f"📦 Завантажую угоди для бригади №{brigade}…")
 
     deals: List[Dict[str, Any]] = await b24(
         "crm.deal.list",
         filter={"CLOSED": "N", "STAGE_ID": f"C20:{stage_code}"},
         order={"DATE_CREATE": "DESC"},
-        select=["*"]
+        select=[
+            # базові поля для картки
+            "ID", "TITLE", "TYPE_ID", "CATEGORY_ID", "STAGE_ID",
+            "COMMENTS", "CONTACT_ID",
+            # UF-поля, які потрібні у картці:
+            "UF_CRM_6009542BC647F",  # Адреса
+            "UF_CRM_1602756048",     # Роутер (enum id)
+            "UF_CRM_1604468981320",  # Вартість роутера
+            # якщо десь ще використовуєш суму/валюту — залиш; інакше можна прибрати:
+            "OPPORTUNITY", "CURRENCY_ID",
+        ]
     )
+
     if not deals:
         await c.message.answer("Немає активних угод.")
         return
 
+    # Надсилаємо картки (у send_deal_card вже має бути disable_web_page_preview=True)
     for d in deals[:25]:
         await send_deal_card(c.message.chat.id, d)
+
 
 
 @dp.callback_query(F.data.startswith("close:"))
