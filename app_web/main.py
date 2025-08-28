@@ -1,688 +1,268 @@
 # app_web/main.py
-import os
-import json
-import math
 import asyncio
-import datetime as dt
-from typing import Optional
-from contextlib import suppress
+import html
+import json
+import logging
+import re
+from typing import Any, Dict, List, Optional
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, Command
-from aiogram.enums import ParseMode
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest
-
+import aiohttp
 from fastapi import FastAPI, Request
-from starlette.responses import JSONResponse
-from starlette import status
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+    CallbackQuery,
+)
 
 from shared.settings import settings
-from shared.team_names import TEAMS
-from shared.tz import KYIV_TZ
-from shared.repo import (
-    connect, get_user, upsert_user_team,
-    ensure_schema_and_seed, set_user_bitrix_id
-)
-from shared.bx import (
-    # tasks
-    list_tasks, complete_task, add_comment, search_user_by_email, get_task,
-    # deals
-    list_deal_stages, list_deals, move_deal_to_stage, comment_deal, get_deal, get_contact
-)
-from worker.report_worker import daily_loop, build_full_report
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("app")
 
-# --------- Deals settings (env)
-DEAL_CATEGORY_ID = int(os.getenv("DEAL_CATEGORY_ID", "0") or 0)       # напр. 20
-DEAL_DONE_STAGE_ID = os.getenv("DEAL_DONE_STAGE_ID", "").strip()      # напр. C20:WON або C20:UC_xxx
-try:
-    TEAM_STAGE_MAP = json.loads(os.getenv("TEAM_STAGE_MAP", "{}"))    # {"1":"C20:UC_..","2":"C20:UC_..",...}
-except Exception:
-    TEAM_STAGE_MAP = {}
-
-# ===== Нові опційні мапи з Env
-# Мапа для enum-поля моделі роутера (UF_CRM_1602756048: ID -> текст)
-try:
-    ROUTER_MODEL_MAP = json.loads(os.getenv("ROUTER_MODEL_MAP", "{}")) or {}
-except Exception:
-    ROUTER_MODEL_MAP = {}
-
-# Мапа для "людської" назви типу угоди (SALE/GOODS/...) -> текст ("Підключення", "Ремонт", ...)
-try:
-    DEAL_TYPE_HUMAN_MAP = json.loads(os.getenv("DEAL_TYPE_HUMAN_MAP", "{}")) or {}
-except Exception:
-    DEAL_TYPE_HUMAN_MAP = {}
-
-
-# --------- Helpers for stages
-def _normalize(s: str) -> str:
-    return "".join(str(s).lower().replace("№", "").split())
-
-async def _resolve_team_stage_id(team_id: int) -> str:
-    # 1) explicit map via env
-    sid = str(TEAM_STAGE_MAP.get(str(team_id), TEAM_STAGE_MAP.get(team_id, ""))).strip()
-    if sid:
-        return sid
-    # 2) try to find by stage name containing team name
-    team_name = TEAMS.get(team_id, "")
-    if not (DEAL_CATEGORY_ID and team_name):
-        return ""
-    try:
-        stages = list_deal_stages(DEAL_CATEGORY_ID)  # [{STATUS_ID/ID, NAME, ...}]
-    except Exception:
-        return ""
-    tn = _normalize(team_name)
-    for st in stages:
-        name = (st.get("NAME") or st.get("name") or "")
-        code = (st.get("STATUS_ID") or st.get("STATUSID") or st.get("ID") or st.get("id"))
-        nrm = _normalize(name)
-        if tn in nrm or tn.replace("бригада", "brigada") in nrm:
-            return str(code)
-    return ""
-
-
-# --------- Bot / Web (create BEFORE any @app.* decorators)
-bot = Bot(settings.BOT_TOKEN)
-dp = Dispatcher()
 app = FastAPI()
+bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
+# ----------------------------- Bitrix helpers -----------------------------
 
-# ========= BASIC FLOW: start & team selection =========
-@dp.message(CommandStart())
-async def start(m: types.Message):
-    conn = await connect()
-    row = await get_user(conn, m.from_user.id)
-    await conn.close()
-
-    kb = InlineKeyboardBuilder()
-    if row and row.get("team_id"):
-        kb.button(text="📋 Мої задачі", callback_data="tasks:list:open:1")
-        kb.button(text="📦 Мої угоди", callback_data="deals:list_all")
-        kb.button(text="🔁 Змінити бригаду", callback_data="team:change")
-        kb.adjust(1, 1, 1)
-        await m.answer(
-            f"Ви у бригаді: *{TEAMS.get(row['team_id'], '?')}*.\nГотові працювати ✅",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb.as_markup(),
-        )
-        return
-
-    for tid, name in TEAMS.items():
-        kb.button(text=name, callback_data=f"team:set:{tid}")
-    kb.adjust(2, 3)
-    await m.answer("Оберіть вашу бригаду:", reply_markup=kb.as_markup())
-
-
-@dp.callback_query(F.data.startswith("team:change"))
-async def change_team(c: types.CallbackQuery):
-    kb = InlineKeyboardBuilder()
-    for tid, name in TEAMS.items():
-        kb.button(text=name, callback_data=f"team:set:{tid}")
-    kb.adjust(2, 3)
-    with suppress(Exception):
-        await c.message.edit_text("Оберіть вашу бригаду:", reply_markup=kb.as_markup())
-    await c.answer()
-
-
-@dp.callback_query(F.data.startswith("team:set:"))
-async def team_set(c: types.CallbackQuery):
-    tid = int(c.data.split(":")[-1])
-    full_name = f"{c.from_user.first_name or ''} {c.from_user.last_name or ''}".strip()
-
-    conn = await connect()
-    await upsert_user_team(conn, c.from_user.id, full_name, tid)
-    await conn.close()
-
-    text = f"Бригаду встановлено: *{TEAMS.get(tid, '—')}*. Готово ✅"
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Мої задачі", callback_data="tasks:list:open:1")
-    kb.button(text="📦 Мої угоди", callback_data="deals:list_all")
-    with suppress(Exception):
-        await c.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb.as_markup())
-    await c.answer("Збережено ✅", show_alert=False)
-
-
-# ========= DIAGNOSTICS & BIND =========
-@dp.message(Command("whoami"))
-async def whoami(m: types.Message):
-    conn = await connect()
-    u = await get_user(conn, m.from_user.id)
-    await conn.close()
-    team = TEAMS.get(u["team_id"]) if u and u.get("team_id") else "—"
-    bx = u.get("bitrix_user_id") if u else None
-    await m.answer(f"TG: {m.from_user.id}\nTeam: {team}\nBitrix ID: {bx or 'не прив’язано'}")
-
-
-@dp.message(Command("bind"))
-async def bind_email(m: types.Message):
-    parts = (m.text or "").split()
-    if len(parts) != 2 or "@" not in parts[1]:
-        await m.answer("Приклад: `/bind user@company.com`", parse_mode=ParseMode.MARKDOWN)
-        return
-    email = parts[1].strip()
-    try:
-        res = search_user_by_email(email) or []
-        user = res[0] if isinstance(res, list) and res else None
-        bx_id = int(user.get("ID")) if user else None
-        if not bx_id:
-            await m.answer("Не знайшов користувача в Bitrix 🤔")
-            return
-        conn = await connect()
-        await set_user_bitrix_id(conn, m.from_user.id, bx_id)
-        await conn.close()
-        await m.answer(f"Прив’язано Bitrix ID: {bx_id} ✅")
-    except Exception as e:
-        await m.answer(f"Не вдалось прив’язати: {e!s}")
-
-
-# ========= TASKS (helpers) =========
-PAGE_SIZE = 8
-
-def _extract_deal_id_from_task(task: dict) -> Optional[int]:
-    cand = task.get("UF_CRM_TASK") or task.get("ufCrmTask") or []
-    if isinstance(cand, str):
-        cand = [cand]
-    for s in cand:
-        if str(s).startswith("D_"):
-            with suppress(Exception):
-                return int(str(s).split("_", 1)[1])
-    return None
-
-# === Нові хелпери для угод
-def _deal_type_name(type_id: str | None) -> str:
-    if not type_id:
-        return "—"
-    # пріоритет: ENV-мапа; інакше покажемо код як є (SALE/GOODS/...)
-    return DEAL_TYPE_HUMAN_MAP.get(str(type_id), str(type_id))
-
-def _router_model_name(value: str | int | None) -> str:
-    if value in (None, "", 0, "0"):
-        return "—"
-    s = str(value)
-    return ROUTER_MODEL_MAP.get(s) or s  # якщо в мапі нема — покажемо ID
-
-def _parse_router_price(v: str | None) -> str:
-    # очікуємо "1700|UAH" або порожньо
-    if not v:
-        return "—"
-    s = str(v)
-    if "|" in s:
-        amount, cur = s.split("|", 1)
-        amount = amount.strip()
-        cur = cur.strip()
-        return f"{amount} {cur}" if amount else "—"
-    return s
-
-def _format_deal_for_message(deal: dict, contact: Optional[dict]) -> str:
-    # Адреса: користувацьке поле з B24
-    address = deal.get("UF_CRM_6009542BC647F") or deal.get("ADDRESS") or "—"
-    router_model = _router_model_name(deal.get("UF_CRM_1602756048"))
-    router_price = _parse_router_price(deal.get("UF_CRM_1604468981320"))
-    type_human = _deal_type_name(deal.get("TYPE_ID"))
-    category = deal.get("CATEGORY_ID") or deal.get("CATEGORY") or "—"
-    comment = (deal.get("COMMENTS") or "").strip() or "—"
-
-    contact_line = "—"
-    if contact:
-        name = " ".join(filter(None, [contact.get("NAME"), contact.get("SECOND_NAME"), contact.get("LAST_NAME")])).strip()
-        phone = ""
-        if isinstance(contact.get("PHONE"), list) and contact["PHONE"]:
-            phone = contact["PHONE"][0].get("VALUE") or ""
-        contact_line = f"{name or 'Контакт'} {phone}".strip()
-
-    return "\n".join([
-        f"Тип: {type_human}",
-        f"Категорія: {category}",
-        f"Адреса: {address}",
-        f"Роутер: {router_model}",
-        f"Вартість роутера: {router_price}",
-        f"Коментар: {comment}",
-        f"Контакт: {contact_line}",
-    ])
-
-def _task_line(t: dict, mode: str) -> str:
-    status_map = {1:"Нова",2:"В очікуванні",3:"В роботі",4:"Відкладена",5:"Завершена"}
-    tid = t.get("ID") or t.get("id")
-    title = (t.get("TITLE") or t.get("title") or "").strip()
-    deadline = t.get("DEADLINE") or t.get("deadline")
-    status = t.get("STATUS") or t.get("status")
-
-    dl_str = ""
-    if deadline:
-        try:
-            dl = dt.datetime.fromisoformat(str(deadline).replace("Z","+00:00")).astimezone(KYIV_TZ)
-            dl_str = dl.strftime("%d.%m %H:%M")
-        except Exception:
-            dl_str = str(deadline)
-
-    status_txt = status_map.get(int(status)) if str(status).isdigit() else (str(status) if status else "")
-    suffix = f" • до {dl_str}" if dl_str else ""
-    extra_s = f" ({status_txt})" if status_txt and mode not in ("closed_today",) else ""
-    return f"• #{tid}: {title}{suffix}{extra_s}"
-
-def _mode_header(mode: str) -> str:
-    return {
-        "today": "Завдання на сьогодні",
-        "overdue": "Прострочені завдання",
-        "closed_today": "Сьогодні закриті",
-        "open": "Активні задачі",
-    }.get(mode, "Завдання")
-
-def _render_tasks_page(tasks: list[dict], page: int, mode: str) -> str:
-    total = len(tasks)
-    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(1, min(page, pages))
-    start = (page - 1) * PAGE_SIZE
-    chunk = tasks[start:start + PAGE_SIZE]
-
-    lines = [f"{_mode_header(mode)} (стор. {page}/{pages}, всього: {total})"]
-    for t in chunk:
-        lines.append(_task_line(t, mode))
-    return "\n".join(lines)
-
-def _tasks_nav_kb(mode: str, page: int, total: int) -> types.InlineKeyboardMarkup:
-    pages = max(1, math.ceil(max(0, total) / PAGE_SIZE))
-    page = max(1, min(page, pages))
-    prev_p = max(1, page - 1)
-    next_p = min(pages, page + 1)
-
-    kb = InlineKeyboardBuilder()
-    # пагінація
-    kb.button(text="◀️", callback_data=f"tasks:list:{mode}:{prev_p}")
-    kb.button(text="▶️", callback_data=f"tasks:list:{mode}:{next_p}")
-    # фільтри
-    kb.button(text="🗓 Сьогодні", callback_data="tasks:list:today:1")
-    kb.button(text="⏰ Прострочені", callback_data="tasks:list:overdue:1")
-    kb.button(text="🟢 Відкриті", callback_data="tasks:list:open:1")
-    kb.button(text="🔄 Оновити", callback_data=f"tasks:list:{mode}:{page}")
-    kb.adjust(2, 2, 2)
-    return kb.as_markup()
-
-
-# ========= TASKS (commands & callbacks) =========
-@dp.message(Command("tasks"))
-async def my_tasks(m: types.Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Відкрити список", callback_data="tasks:list:open:1")
-    await m.answer("Натисніть, щоб побачити список задач:", reply_markup=kb.as_markup())
-
-
-@dp.callback_query(F.data.startswith("tasks:list:"))
-async def tasks_list_cb(c: types.CallbackQuery):
-    with suppress(Exception):
-        await c.answer()
-    parts = c.data.split(":")  # tasks:list:<mode>:<page>
-    mode = parts[2] if len(parts) > 2 else "open"
-    page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
-    await _show_tasks_page(c.message.chat.id, mode, page, edit_message=c.message)
-
-
-@dp.callback_query(F.data.startswith("tasks:open"))
-async def tasks_open_cb(c: types.CallbackQuery):
-    with suppress(Exception):
-        await c.answer()
-    with suppress(TelegramBadRequest):
-        await c.message.edit_text("📦 Завантажую …")
-    await _show_tasks_page(c.message.chat.id, "open", 1, edit_message=c.message)
-
-
-async def _show_tasks_page(chat_id: int, mode: str, page: int, edit_message: Optional[types.Message] = None):
-    # 1) get user & bx id
-    conn = await connect()
-    try:
-        u = await get_user(conn, chat_id)   # приватні чати: tg_user_id == chat_id
-    finally:
-        await conn.close()
-
-    bx_id = u["bitrix_user_id"] if u else None
-    if not bx_id:
-        await bot.send_message(chat_id, "Спочатку прив’яжіть Bitrix: /bind email")
-        return
-
-    # 2) filters by mode
-    now = dt.datetime.now(KYIV_TZ)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
-
-    if mode in ("today","сьогодні"):
-        extra = {">=DEADLINE": day_start.isoformat(), "<=DEADLINE": day_end.isoformat()}
-    elif mode in ("overdue","прострочені","over"):
-        extra = {"<DEADLINE": now.isoformat(), "!STATUS": 5}
-    elif mode in ("closed_today","done_today"):
-        extra = {">=CLOSED_DATE": day_start.isoformat(), "<=CLOSED_DATE": day_end.isoformat()}
-    else:
-        extra = {"REAL_STATUS": 2}   # активні
-
-    fields = ["ID","TITLE","DEADLINE","STATUS","UF_CRM_TASK"]
-    filters = [{"RESPONSIBLE_ID": bx_id, **extra}]
-
-    bag = {}
-    for f in filters:
-        try:
-            res = list_tasks(f, fields)
-            arr = res.get("result") if isinstance(res, dict) else (res or [])
-            for t in arr:
-                tid = str(t.get("ID") or t.get("id"))
-                if tid and tid not in bag:
-                    bag[tid] = t
-        except Exception:
-            pass
-
-    tasks = list(bag.values())
-    text = _render_tasks_page(tasks, page, mode)
-    kb = _tasks_nav_kb(mode, page, len(tasks))
-
-    if edit_message:
-        with suppress(TelegramBadRequest):
-            await edit_message.edit_text(text, reply_markup=kb)
-    else:
-        await bot.send_message(chat_id, text, reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("task:details:"))
-async def task_details(c: types.CallbackQuery):
-    with suppress(Exception):
-        await c.answer()
-
-    tid = int(c.data.split(":")[-1])
-    try:
-        task = get_task(tid) or {}
-        deal_id = _extract_deal_id_from_task(task)
-
-        deal, contact = {}, None
-        if deal_id:
-            deal = get_deal(deal_id) or {}
-            if deal.get("CONTACT_ID"):
-                with suppress(Exception):
-                    contact = get_contact(int(deal["CONTACT_ID"])) or None
-
-        title = (task.get("TITLE") or "").strip()
-        head = f"# {tid} • {title}" if title else f"# {tid}"
-        body = _format_deal_for_message(deal, contact) if deal else "Прив’язану угоду не знайдено."
-        text = f"{head}\n\n{body}"
-
-        kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Закрити", callback_data=f"task:done:{tid}")
-        kb.button(text="🔙 До списку", callback_data="tasks:list:open:1")
-        kb.adjust(2)
-
-        with suppress(TelegramBadRequest):
-            await c.message.edit_text(text, reply_markup=kb.as_markup())
-    except Exception:
-        with suppress(Exception):
-            await bot.send_message(c.message.chat.id, f"Не вдалося завантажити деталі задачі #{tid} ❌")
-
-
-@dp.callback_query(F.data.startswith("task:done:"))
-async def task_done_cb(c: types.CallbackQuery):
-    with suppress(Exception):
-        await c.answer()
-
-    tid = int(c.data.split(":")[-1])
-    try:
-        complete_task(tid)
-        with suppress(Exception):
-            add_comment(tid, "Закрито через Telegram-бот ✅")
-
-        with suppress(TelegramBadRequest):
-            await c.message.edit_reply_markup(reply_markup=None)
-
-        await bot.send_message(c.message.chat.id, f"Задачу #{tid} завершено ✅")
-    except Exception as e:
-        with suppress(Exception):
-            await bot.send_message(c.message.chat.id, f"Не вдалося завершити #{tid}: {e!s}")
-
-
-# ========= QUICK TASK ACTIONS (slash) =========
-@dp.message(Command("done"))
-async def done(m: types.Message):
-    parts = (m.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await m.answer("Приклад: `/done 1234 коментар`", parse_mode=ParseMode.MARKDOWN)
-        return
-    task_id = int(parts[1])
-    comment = " ".join(parts[2:]) or "Завершено через Telegram-бот"
-    try:
-        complete_task(task_id)
-        add_comment(task_id, comment)
-        await m.answer(f"Задачу #{task_id} завершено ✅")
-    except Exception as e:
-        await m.answer(f"Не вдалося завершити #{task_id}: {e!s}")
-
-
-@dp.message(Command("chatid"))
-async def chatid(m: types.Message):
-    await m.answer(f"Chat ID: {m.chat.id}")
-
-
-# ========= DEALS (CRM) =========
-@dp.message(Command("stages"))
-async def stages(m: types.Message):
-    if not DEAL_CATEGORY_ID:
-        await m.answer("Задайте DEAL_CATEGORY_ID у Secrets.")
-        return
-    try:
-        sts = list_deal_stages(DEAL_CATEGORY_ID)
-    except Exception as e:
-        await m.answer(f"Помилка отримання етапів: {e!s}")
-        return
-    if not sts:
-        await m.answer("Етапи не знайдено або нестачає прав.")
-        return
-    lines = [f"{(s.get('STATUS_ID') or s.get('ID'))}: {s.get('NAME')}" for s in sts]
-    await m.answer("Етапи цієї воронки:\n" + "\n".join(lines))
-
-
-def _deal_header_line(d: dict) -> str:
-    did = d.get("ID")
-    title = (d.get("TITLE") or "").strip()
-    money = ""
-    if d.get("OPPORTUNITY"):
-        cur = d.get("CURRENCY_ID") or ""
-        money = f" • {d['OPPORTUNITY']} {cur}"
-    return f"#{did}: {title}{money}"
-
-async def _send_deal_card(chat_id: int, deal: dict):
-    # отримати контакт
-    contact = None
+B24_BASE = settings.BITRIX_WEBHOOK_BASE.rstrip("/")
+HTTP: aiohttp.ClientSession
+
+
+async def b24(method: str, **params) -> Any:
+    """Call Bitrix REST method."""
+    url = f"{B24_BASE}/{method}.json"
+    async with HTTP.post(url, json=params) as resp:
+        data = await resp.json()
+        if "error" in data:
+            raise RuntimeError(f"B24 error: {data['error']}: {data.get('error_description')}")
+        return data.get("result")
+
+
+# ----------------------------- Caches -------------------------------------
+
+_DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
+_ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None   # UF_CRM_1602756048 optionId -> text
+
+
+async def get_deal_type_map() -> Dict[str, str]:
+    global _DEAL_TYPE_MAP
+    if _DEAL_TYPE_MAP is None:
+        items = await b24("crm.status.list", filter={"ENTITY_ID": "DEAL_TYPE"})
+        # items: [{ID:'SALE', NAME:'Продаж', ...}, ...]
+        _DEAL_TYPE_MAP = {i["STATUS_ID"]: i["NAME"] for i in items}
+    return _DEAL_TYPE_MAP
+
+
+async def get_router_enum_map() -> Dict[str, str]:
+    """
+    Find custom userfield UF_CRM_1602756048 and get LIST options.
+    """
+    global _ROUTER_ENUM_MAP
+    if _ROUTER_ENUM_MAP is None:
+        fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
+        uf = next((f for f in fields if f.get("FIELD_NAME") == "UF_CRM_1602756048"), None)
+        options = {}
+        if uf and isinstance(uf.get("LIST"), list):
+            for o in uf["LIST"]:
+                # o: {'ID': '5162', 'VALUE': 'TP-Link EC220-G5', ...}
+                options[str(o["ID"])] = o["VALUE"]
+        _ROUTER_ENUM_MAP = options
+    return _ROUTER_ENUM_MAP
+
+
+# ----------------------------- Formatting ----------------------------------
+
+BR = "<br>"
+
+
+def _strip_bb(text: str) -> str:
+    """Bitrix comments may come with [p]...[/p] etc."""
+    if not text:
+        return ""
+    t = re.sub(r"\[/?p\]", "", text, flags=re.I)
+    return t.strip()
+
+
+def _money_pair(val: Optional[str]) -> Optional[str]:
+    """
+    Parse strings like '1700|UAH' -> '1700 UAH'
+    """
+    if not val:
+        return None
+    parts = str(val).split("|", 1)
+    if len(parts) == 2:
+        return f"{parts[0]} {parts[1]}"
+    return val
+
+
+async def render_deal_card(deal: Dict[str, Any]) -> str:
+    deal_type_map = await get_deal_type_map()
+    router_map = await get_router_enum_map()
+
+    deal_id = deal.get("ID")
+    title = deal.get("TITLE") or f"Deal #{deal_id}"
+    amount = f"{deal.get('OPPORTUNITY', '0.00')} {deal.get('CURRENCY_ID', 'UAH')}"
+    type_code = deal.get("TYPE_ID") or ""
+    type_name = deal_type_map.get(type_code, type_code or "—")
+    category = deal.get("CATEGORY_ID", "—")
+
+    address = deal.get("UF_CRM_6009542BC647F") or "—"
+
+    router_id = str(deal.get("UF_CRM_1602756048") or "")  # may be '', '5162', etc
+    router_name = router_map.get(router_id) if router_id else "—"
+
+    router_price = _money_pair(deal.get("UF_CRM_1604468981320")) or "—"
+
+    comments = _strip_bb(deal.get("COMMENTS") or "")
+
+    contact_name = "—"
+    contact_phone = ""
     if deal.get("CONTACT_ID"):
-        with suppress(Exception):
-            contact = get_contact(int(deal["CONTACT_ID"])) or None
+        try:
+            c = await b24("crm.contact.get", id=deal["CONTACT_ID"])
+            if c:
+                contact_name = f"{c.get('NAME', '')} {c.get('SECOND_NAME', '')} {c.get('LAST_NAME', '')}".strip() or "—"
+                # pick first phone
+                phones = c.get("PHONE") or []
+                if isinstance(phones, list) and phones:
+                    contact_phone = phones[0].get("VALUE") or ""
+        except Exception as e:
+            log.warning("contact.get failed: %s", e)
 
-    head = _deal_header_line(deal)
-    body = _format_deal_for_message(deal, contact)
-    text = f"[{head}](https://{settings.B24_DOMAIN}/crm/deal/details/{deal.get('ID')}/)\n\n{body}"
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Закрити угоду", callback_data=f"deal:won:{deal.get('ID')}")
-    kb.adjust(1)
-
-    with suppress(TelegramBadRequest):
-        await bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data == "deals:list_all")
-async def list_all_deals_for_team(c: types.CallbackQuery):
-    with suppress(Exception):
-        await c.answer()
-    # user + team
-    conn = await connect()
-    u = await get_user(conn, c.from_user.id)
-    await conn.close()
-    if not u or not u.get("team_id"):
-        await bot.send_message(c.message.chat.id, "Спочатку оберіть бригаду через /start.")
-        return
-
-    stage_id = await _resolve_team_stage_id(int(u["team_id"]))
-    if not stage_id:
-        await bot.send_message(c.message.chat.id, "Не знайшов етап для цієї бригади. Використайте /stages або задайте TEAM_STAGE_MAP.")
-        return
-
-    with suppress(TelegramBadRequest):
-        await c.message.edit_text("📦 Завантажую угоди бригади…")
-
-    try:
-        res = list_deals(
-            {"CATEGORY_ID": DEAL_CATEGORY_ID, "STAGE_ID": stage_id},
-            ["ID","TITLE","STAGE_ID","ASSIGNED_BY_ID","DATE_CREATE","OPPORTUNITY","CURRENCY_ID",
-             "TYPE_ID","CATEGORY_ID","COMMENTS","UF_CRM_6009542BC647F","UF_CRM_1602756048","UF_CRM_1604468981320","CONTACT_ID"]
-        )
-    except Exception as e:
-        await bot.send_message(c.message.chat.id, f"Помилка запиту угод: {e!s}")
-        return
-
-    items = res.get("result") if isinstance(res, dict) else (res or [])
-    if not items:
-        await bot.send_message(c.message.chat.id, "Угод у цій колонці поки немає 🙂")
-        return
-
-    # розсилаємо картками
-    for d in items:
-        await _send_deal_card(c.message.chat.id, d)
+    head = f"#{deal_id} • {html.escape(title)}"
+    link = f"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/"
+    body_lines = [
+        f"<b>Сума:</b> {html.escape(amount)}",
+        "",
+        f"<b>Тип сделки:</b> {html.escape(type_name)}",
+        f"<b>Категорія:</b> {html.escape(str(category))}",
+        f"<b>Адреса:</b> {html.escape(address)}",
+        f"<b>Роутер:</b> {html.escape(router_name)}",
+        f"<b>Вартість роутера:</b> {html.escape(router_price)}",
+        f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
+        "",
+        f"<b>Контакт:</b> {html.escape(contact_name)}" + (f" • <a href=\"tel:{contact_phone}\">{html.escape(contact_phone)}</a>" if contact_phone else ""),
+        "",
+        f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
+    ]
+    return f"<b>{head}</b>{BR*2}" + BR.join(body_lines)
 
 
-@dp.message(Command("deals"))
-async def deals_for_team(m: types.Message):
-    if not DEAL_CATEGORY_ID:
-        await m.answer("Задайте DEAL_CATEGORY_ID у Secrets (ID воронки, напр. 20).")
-        return
-
-    conn = await connect()
-    u = await get_user(conn, m.from_user.id)
-    await conn.close()
-    if not u or not u.get("team_id"):
-        await m.answer("Спочатку оберіть бригаду через /start.")
-        return
-
-    stage_id = await _resolve_team_stage_id(int(u["team_id"]))
-    if not stage_id:
-        await m.answer("Не знайшов етап для цієї бригади. Виведіть /stages і задайте TEAM_STAGE_MAP або назвіть етап як «Бригада N».")
-        return
-
-    try:
-        res = list_deals(
-            {"CATEGORY_ID": DEAL_CATEGORY_ID, "STAGE_ID": stage_id},
-            ["ID","TITLE","STAGE_ID","ASSIGNED_BY_ID","DATE_CREATE","OPPORTUNITY","CURRENCY_ID"]
-        )
-    except Exception as e:
-        await m.answer(f"Помилка запиту угод: {e!s}")
-        return
-
-    items = res.get("result") if isinstance(res, dict) else (res or [])
-    if not items:
-        await m.answer("Угод у цій колонці поки немає 🙂")
-        return
-
-    lines = [f"Угоди для *{TEAMS.get(int(u['team_id']), 'бригади')}* (до {len(items)}):"]
-    for d in items:
-        lines.append("• " + _deal_header_line(d))
-    await m.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
+    deal_id = str(deal.get("ID"))
+    kb = [
+        [
+            InlineKeyboardButton(text="✅ Закрити угоду", callback_data=f"close:{deal_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-@dp.callback_query(F.data.startswith("deal:won:"))
-async def deal_won_cb(c: types.CallbackQuery):
-    with suppress(Exception):
-        await c.answer()
-    if not DEAL_DONE_STAGE_ID:
-        await bot.send_message(c.message.chat.id, "Задайте DEAL_DONE_STAGE_ID у Secrets.")
-        return
-    deal_id = int(c.data.split(":")[-1])
-    try:
-        move_deal_to_stage(deal_id, DEAL_DONE_STAGE_ID)
-        with suppress(Exception):
-            comment_deal(deal_id, "Закрито через Telegram-бот ✅")
-        await bot.send_message(c.message.chat.id, f"Угоду #{deal_id} переведено в етап `{DEAL_DONE_STAGE_ID}` ✅", parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        await bot.send_message(c.message.chat.id, f"Не вдалося оновити угоду #{deal_id}: {e!s}")
+async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
+    text = await render_deal_card(deal)
+    await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal))
 
 
-@dp.message(Command("won"))
-async def deal_won_cmd(m: types.Message):
-    parts = (m.text or "").split(maxsplit=2)
-    if len(parts) < 2 or not parts[1].isdigit():
-        await m.answer("Приклад: `/won 113776 Коментар`", parse_mode=ParseMode.MARKDOWN)
-        return
-    deal_id = int(parts[1])
-    comment = parts[2] if len(parts) > 2 else "Закрито через Telegram-бот"
+# ----------------------------- Handlers ------------------------------------
 
-    stage_done = DEAL_DONE_STAGE_ID
-    if not stage_done:
-        await m.answer("Задайте DEAL_DONE_STAGE_ID у Secrets. Використайте /stages, щоб побачити список етапів.")
-        return
-    try:
-        move_deal_to_stage(deal_id, stage_done)
-        with suppress(Exception):
-            comment_deal(deal_id, comment)
-        await m.answer(f"Угоду #{deal_id} переведено в етап `{stage_done}` ✅", parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        await m.answer(f"Не вдалося оновити угоду #{deal_id}: {e!s}")
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Мої задачі", callback_data="tasks")],
+        [InlineKeyboardButton(text="📦 Мої угоди", callback_data="my_deals")],
+    ])
+    await m.answer("Готові працювати ✅", reply_markup=kb)
 
 
-# ========= DEBUG/DUMP =========
+@dp.callback_query(F.data == "my_deals")
+async def cb_my_deals(c: CallbackQuery):
+    await c.answer()
+    user_id = c.from_user.id
+
+    # TODO: заміни на свій мапінг Telegram→Bitrix користувача
+    # Поки що – просто віддаємо всі відкриті угоди по всій воронці (демо).
+    await c.message.answer("📦 Завантажую угоди бригади…")
+
+    deals: List[Dict[str, Any]] = await b24(
+        "crm.deal.list",
+        filter={"CLOSED": "N"},
+        order={"DATE_CREATE": "DESC"},
+        select=["*"]
+    )
+    for d in deals[:25]:
+        await send_deal_card(c.message.chat.id, d)
+
+
 @dp.message(Command("deal_dump"))
-async def deal_dump(m: types.Message):
-    parts = (m.text or "").split()
-    if len(parts) < 2:
-        await m.answer("Приклад: `/deal_dump 1109122`", parse_mode=ParseMode.MARKDOWN)
+async def deal_dump(m: Message):
+    # /deal_dump 1109122  або /deal_dump #1109122
+    mtext = (m.text or "").strip()
+    m2 = re.search(r"(\d+)", mtext)
+    if not m2:
+        await m.answer("Вкажіть ID угоди: /deal_dump 12345")
         return
-    raw = parts[1].lstrip("#")
-    if not raw.isdigit():
-        await m.answer("ID має бути числом.", parse_mode=ParseMode.MARKDOWN)
+    deal_id = m2.group(1)
+    deal = await b24("crm.deal.get", id=deal_id)
+    if not deal:
+        await m.answer("Не знайшов угоду.")
         return
-    did = int(raw)
-    try:
-        d = get_deal(did) or {}
-        # шлемо без parse_mode, щоб не падало на markdown-символах
-        js = json.dumps(d, ensure_ascii=False, indent=2)
-        # ріжемо на шматки по 3500 символів
-        for i in range(0, len(js), 3500):
-            await m.answer(js[i:i+3500])
-    except Exception as e:
-        await m.answer(f"Помилка: {e!s}")
+
+    # красиво відформатувати
+    pretty = html.escape(json.dumps(deal, ensure_ascii=False, indent=2))
+    await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>")
+
+    # і одразу картка
+    await send_deal_card(m.chat.id, deal)
 
 
-# ========= REPORTS =========
-@dp.message(Command("report_now"))
-async def report_now(m: types.Message):
-    text = await build_full_report()
-    await bot.send_message(settings.MASTER_REPORT_CHAT_ID, text)
-    await m.answer("Звіт відправлено в майстер-групу ✅")
+@dp.callback_query(F.data.startswith("close:"))
+async def cb_close_deal(c: CallbackQuery):
+    await c.answer()
+    deal_id = c.data.split(":", 1)[1]
+    deal = await b24("crm.deal.get", id=deal_id)
+    if not deal:
+        await c.message.answer("❗️Не знайшов угоду.")
+        return
+    category = str(deal.get("CATEGORY_ID") or "0")
+    target_stage = f"C{category}:WON"
+    await b24("crm.deal.update", id=deal_id, fields={"STAGE_ID": target_stage})
+    await c.message.answer(f"✅ Угоду #{deal_id} закрито у статусі WON.")
+    # оновлена картка
+    deal2 = await b24("crm.deal.get", id=deal_id)
+    await send_deal_card(c.message.chat.id, deal2)
 
 
-# ========= Webhook (route) =========
-OLD_SECRET = os.getenv("WEBHOOK_SECRET_OLD", "").strip()
+# ----------------------------- Webhook plumbing ----------------------------
+
+@app.on_event("startup")
+async def on_startup():
+    global HTTP
+    HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+    # реєстрація вебхука
+    url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
+    log.info("[startup] setting webhook to: %s", url)
+    await bot.set_webhook(url)
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.delete_webhook()
+    await HTTP.close()
+    await bot.session.close()
+
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
-    valid = {settings.WEBHOOK_SECRET.strip()}
-    if OLD_SECRET:
-        valid.add(OLD_SECRET)
-
-    if secret.strip() not in valid:
-        print("[webhook] WRONG SECRET got:", secret, "| expected one of:", list(valid))
-        return JSONResponse({"ok": False}, status_code=status.HTTP_404_NOT_FOUND)
-
-    update = types.Update.model_validate(await request.json(), context={"bot": bot})
-    try:
-        await dp.feed_update(bot, update)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e):
-            raise
-    return JSONResponse({"ok": True})
-
-
-# ========= Startup =========
-@app.on_event("startup")
-async def on_startup():
-    await ensure_schema_and_seed()
-
-    await bot.delete_webhook(drop_pending_updates=True)
-    url = f"{settings.WEBHOOK_BASE}/webhook/{settings.WEBHOOK_SECRET}"
-    print("[startup] setting webhook to:", url)
-    await bot.set_webhook(
-        url=url,
-        allowed_updates=["message", "callback_query"],
-    )
-
-    if getattr(settings, "RUN_WORKER_IN_APP", False):
-        asyncio.create_task(daily_loop())
+    if secret != settings.WEBHOOK_SECRET:
+        return {"ok": False}
+    update = Update.model_validate(await request.json())
+    await dp.feed_update(bot, update)
+    return {"ok": True}
