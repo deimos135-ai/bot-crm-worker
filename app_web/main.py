@@ -69,7 +69,6 @@ async def _enum_map_for_userfield(field_name: str) -> Dict[str, str]:
     options: Dict[str, str] = {}
     if uf and isinstance(uf.get("LIST"), list):
         for o in uf["LIST"]:
-            # o: {'ID': '5162', 'VALUE': 'TP-Link EC220-G5', ...}
             options[str(o["ID"])] = o["VALUE"]
     return options
 
@@ -88,13 +87,12 @@ async def get_tariff_enum_map() -> Dict[str, str]:
     return _TARIFF_ENUM_MAP
 
 
-# ----------------------------- Formatting ---------------------------------
+# ----------------------------- UI helpers ---------------------------------
 
 BR = "\n"
 
 
 def _strip_bb(text: str) -> str:
-    """Bitrix comments may come with [p]...[/p] etc."""
     if not text:
         return ""
     t = re.sub(r"\[/?p\]", "", text, flags=re.I)
@@ -102,9 +100,6 @@ def _strip_bb(text: str) -> str:
 
 
 def _money_pair(val: Optional[str]) -> Optional[str]:
-    """
-    Parse strings like '1700|UAH' -> '1700 UAH'
-    """
     if not val:
         return None
     parts = str(val).split("|", 1)
@@ -125,6 +120,16 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     )
 
 
+def pick_brigade_inline_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"Бригада №{i}", callback_data=f"setbrig:{i}")]
+        for i in (1, 2, 3, 4, 5)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ----------------------------- Deal rendering ------------------------------
+
 async def render_deal_card(deal: Dict[str, Any]) -> str:
     deal_type_map = await get_deal_type_map()
     router_map = await get_router_enum_map()
@@ -136,20 +141,16 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
     type_name = deal_type_map.get(type_code, type_code or "—")
     category = deal.get("CATEGORY_ID", "—")
 
-    # адреса з UF, якщо нема — стандартне поле ADDRESS
     address_value = deal.get("UF_CRM_6009542BC647F") or deal.get("ADDRESS") or "—"
 
-    # роутер
     router_id = str(deal.get("UF_CRM_1602756048") or "")
     router_name = router_map.get(router_id) if router_id else "—"
     router_price = _money_pair(deal.get("UF_CRM_1604468981320")) or "—"
 
-    # тариф (enum + price)
     tariff_id = str(deal.get("UF_CRM_1610558031277") or "")
     tariff_name = tariff_map.get(tariff_id) if tariff_id else "—"
     tariff_price = _money_pair(deal.get("UF_CRM_1611652685839")) or "—"
 
-    # підключення (ціна)
     install_price = _money_pair(deal.get("UF_CRM_1609868447208")) or "—"
 
     comments = _strip_bb(deal.get("COMMENTS") or "")
@@ -170,7 +171,6 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
     head = f"#{deal_id} • {html.escape(title)}"
     link = f"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/"
 
-    # телефону не робимо <a href="tel:"> — Telegram сам зробить клікабельним
     contact_line = f"<b>Контакт:</b> {html.escape(contact_name)}"
     if contact_phone:
         contact_line += f" • {html.escape(contact_phone)}"
@@ -191,7 +191,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         "",
         contact_line,
         "",
-        f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
+        f"<a href=\"{link}\">Відкрити в CRM</a>",
     ]
     return f"<b>{head}</b>{BR*2}" + BR.join(body_lines)
 
@@ -208,34 +208,38 @@ async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
         chat_id,
         text,
         reply_markup=deal_keyboard(deal),
-        disable_web_page_preview=True,  # прибирає прев’ю посилань
+        disable_web_page_preview=True,
     )
 
 
-# ----------------------------- Simple binding storage ----------------------
+# ----------------------------- Simple storage (brigade only) ---------------
 
-_BINDINGS: Dict[int, Dict[str, Any]] = {}
-
-
-async def get_binding(user_id: int) -> Optional[Dict[str, Any]]:
-    return _BINDINGS.get(user_id)
+# Тепер зберігаємо лише номер бригади для telegram user id.
+_USER_BRIGADE: Dict[int, int] = {}
 
 
-async def set_binding(user_id: int, email: str, brigade: Optional[int] = None):
-    _BINDINGS[user_id] = {"email": email, "brigade": brigade}
+def get_user_brigade(user_id: int) -> Optional[int]:
+    return _USER_BRIGADE.get(user_id)
+
+
+def set_user_brigade(user_id: int, brigade: int) -> None:
+    _USER_BRIGADE[user_id] = brigade
 
 
 # ----------------------------- Handlers ------------------------------------
 
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    await m.answer(
-        "Готові працювати ✅\n\n"
-        "Спочатку виконайте:\n"
-        "• /bind ваш_email\n"
-        "• /set_brigade 1..5",
-        reply_markup=main_menu_kb(),
-    )
+    b = get_user_brigade(m.from_user.id)
+    text = "Готові працювати ✅"
+    if b:
+        text += f"\nПоточна бригада: №{b}"
+    else:
+        text += "\nОберіть вашу бригаду нижче ⬇️"
+
+    await m.answer(text, reply_markup=main_menu_kb())
+    if not b:
+        await m.answer("Швидкий вибір бригади:", reply_markup=pick_brigade_inline_kb())
 
 
 @dp.message(Command("menu"))
@@ -243,22 +247,12 @@ async def cmd_menu(m: Message):
     await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
 
 
-@dp.message(Command("bind"))
-async def cmd_bind(m: Message):
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await m.answer("Вкажіть email: /bind ваш_email", reply_markup=main_menu_kb())
-        return
-    email = parts[1].strip()
-    await set_binding(m.from_user.id, email=email)
-    await m.answer(f"Прив’язано email: <code>{html.escape(email)}</code> ✅", reply_markup=main_menu_kb())
-
-
 @dp.message(Command("set_brigade"))
 async def cmd_set_brigade(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await m.answer("Вкажіть номер бригади: /set_brigade 1", reply_markup=main_menu_kb())
+        await m.answer("Або натисніть кнопку:", reply_markup=pick_brigade_inline_kb())
         return
     try:
         brigade = int(parts[1])
@@ -266,32 +260,40 @@ async def cmd_set_brigade(m: Message):
         await m.answer("Номер має бути числом: 1..5", reply_markup=main_menu_kb())
         return
 
-    bind = await get_binding(m.from_user.id)
-    if not bind:
-        await m.answer("Спершу виконайте /bind ваш_email", reply_markup=main_menu_kb())
+    if brigade not in (1, 2, 3, 4, 5):
+        await m.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
         return
 
-    bind["brigade"] = brigade
+    set_user_brigade(m.from_user.id, brigade)
     await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
+
+
+# Інлайн-вибір бригади
+@dp.callback_query(F.data.startswith("setbrig:"))
+async def cb_setbrig(c: CallbackQuery):
+    await c.answer()
+    try:
+        brigade = int(c.data.split(":", 1)[1])
+    except Exception:
+        await c.message.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
+        return
+
+    if brigade not in (1, 2, 3, 4, 5):
+        await c.message.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
+        return
+
+    set_user_brigade(c.from_user.id, brigade)
+    await c.message.answer(f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
 
 
 # Текстова кнопка «📦 Мої угоди»
 @dp.message(F.text == "📦 Мої угоди")
 async def msg_my_deals(m: Message):
-    # Віддзеркалюємо логіку з callback
-    user_id = m.from_user.id
-    bind = await get_binding(user_id)
-
-    if not bind or not bind.get("brigade"):
-        await m.answer(
-            "Спершу прив’яжіть акаунт і бригаду:\n"
-            "• /bind ваш_email\n"
-            "• /set_brigade 1..5",
-            reply_markup=main_menu_kb(),
-        )
+    brigade = get_user_brigade(m.from_user.id)
+    if not brigade:
+        await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
 
-    brigade = bind["brigade"]
     stage_code = {
         1: "UC_XF8O6V",
         2: "UC_0XLPCN",
@@ -317,10 +319,10 @@ async def msg_my_deals(m: Message):
             "UF_CRM_6009542BC647F", "ADDRESS",
             # роутер
             "UF_CRM_1602756048",     # enum id
-            "UF_CRM_1604468981320",  # price
+            "UF_CRM_1604468981320",  # router price
             # тариф
             "UF_CRM_1610558031277",  # enum id
-            "UF_CRM_1611652685839",  # price
+            "UF_CRM_1611652685839",  # tariff price
             # підключення (ціна)
             "UF_CRM_1609868447208",
         ],
@@ -334,12 +336,11 @@ async def msg_my_deals(m: Message):
         await send_deal_card(m.chat.id, d)
 
 
+# Сумісність зі старою інлайн-кнопкою (якщо десь залишиться)
 @dp.callback_query(F.data == "my_deals")
 async def cb_my_deals(c: CallbackQuery):
     await c.answer()
-    # тримаємо для сумісності (якщо десь ще є інлайн-кнопка)
-    m = c.message
-    await msg_my_deals(m)
+    await msg_my_deals(c.message)
 
 
 @dp.message(F.text == "📋 Мої задачі")
@@ -349,7 +350,6 @@ async def msg_tasks(m: Message):
 
 @dp.message(Command("deal_dump"))
 async def deal_dump(m: Message):
-    # /deal_dump 1109122  або /deal_dump #1109122
     mtext = (m.text or "").strip()
     m2 = re.search(r"(\d+)", mtext)
     if not m2:
@@ -389,16 +389,14 @@ async def on_startup():
     global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
-    # Команди бота (видимі у Bot Menu)
+    # Команди бота (видимі у Bot Menu). Без /bind.
     await bot.set_my_commands([
         BotCommand(command="start", description="Почати"),
         BotCommand(command="menu", description="Показати меню"),
-        BotCommand(command="bind", description="Прив’язати email"),
         BotCommand(command="set_brigade", description="Вибрати бригаду"),
         BotCommand(command="deal_dump", description="Показати dump угоди"),
     ])
 
-    # Реєстрація вебхука
     url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
     log.info("[startup] setting webhook to: %s", url)
     await bot.set_webhook(url)
