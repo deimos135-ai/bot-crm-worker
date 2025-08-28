@@ -1,29 +1,37 @@
 import os
 
+
 def _must(name: str) -> str:
     v = os.getenv(name)
     if not v:
         raise RuntimeError(f"Missing required env: {name}")
     return v
 
+
 def _bool(name: str, default: str = "0") -> bool:
-    return (os.getenv(name, default) or "").strip() in ("1", "true", "True", "YES", "yes")
+    return (os.getenv(name, default) or "").strip().lower() in ("1", "true", "yes", "y")
+
 
 class Settings:
+    # Telegram / infra
     BOT_TOKEN = _must("TG_BOT_TOKEN")
-    BITRIX_WEBHOOK_BASE = _must("BITRIX_WEBHOOK_BASE")  # https://portal.bitrix24.ua/rest/<user>/<token>
-    DATABASE_URL = _must("DATABASE_URL")
-    WEBHOOK_BASE = _must("WEBHOOK_BASE")               # https://<app>.fly.dev
+    WEBHOOK_BASE = _must("WEBHOOK_BASE")        # https://<app>.fly.dev
     WEBHOOK_SECRET = _must("WEBHOOK_SECRET")
 
-    # одна майстер-група для звітів
-    MASTER_REPORT_CHAT_ID = int(_must("MASTER_REPORT_CHAT_ID"))
+    # Bitrix
+    BITRIX_WEBHOOK_BASE = _must("BITRIX_WEBHOOK_BASE")  # https://portal.bitrix24.<tld>/rest/<user>/<token>
+    B24_DOMAIN = os.getenv("B24_DOMAIN")  # опційно, напр.: fiberlink.bitrix24.eu
 
-    # час відправлення щоденного звіту (година, Europe/Kyiv)
+    # DB
+    DATABASE_URL = _must("DATABASE_URL")
+
+    # Reports
+    MASTER_REPORT_CHAT_ID = int(_must("MASTER_REPORT_CHAT_ID"))
     REPORT_HOUR = int(os.getenv("REPORT_HOUR", "18"))
 
-    # якщо у вас лише один інстанс на Fly, можете запустити воркер в тому ж процесі:
+    # Worker
     RUN_WORKER_IN_APP = _bool("RUN_WORKER_IN_APP", "0")
 
-    # 👇 ДОДАЙ ОСЬ ЦЕ
-    B24_DOMAIN = os.getenv("B24_DOMAIN")  # приклад: fiberlink.bitrix24.eu
+
+# ВАЖЛИВО: інстанс має бути визначений на модульному рівні
+settings = Settings()
