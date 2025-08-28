@@ -138,14 +138,20 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         except Exception as e:
             log.warning("contact.get failed: %s", e)
 
-    head = f"#{deal_id} • {html.escape(title)}"
+        head = f"#{deal_id} • {html.escape(title)}"
     link = f"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/"
+
+    # Адреса: спочатку кастомне поле, потім стандартне
+    address_value = (
+        deal.get("UF_CRM_6009542BC647F")
+        or deal.get("ADDRESS")
+        or "—"
+    )
+
     body_lines = [
-        f"<b>Сума:</b> {html.escape(amount)}",
-        "",
-        f"<b>Тип сделки:</b> {html.escape(type_name)}",
+        f"<b>Тип угоди:</b> {html.escape(type_name)}",
         f"<b>Категорія:</b> {html.escape(str(category))}",
-        f"<b>Адреса:</b> {html.escape(address)}",
+        f"<b>Адреса:</b> {html.escape(address_value)}",
         f"<b>Роутер:</b> {html.escape(router_name)}",
         f"<b>Вартість роутера:</b> {html.escape(router_price)}",
         f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
@@ -158,6 +164,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         "",
         f"<a href=\"{link}\">Відкрити в CRM</a>",
     ]
+
     return f"<b>{head}</b>\n\n" + "\n".join(body_lines)
 
 
