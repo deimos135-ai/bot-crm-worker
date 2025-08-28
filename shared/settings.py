@@ -25,4 +25,5 @@ class Settings:
     # якщо у вас лише один інстанс на Fly, можете запустити воркер в тому ж процесі:
     RUN_WORKER_IN_APP = _bool("RUN_WORKER_IN_APP", "0")
 
-settings = Settings()
+    # 👇 ДОДАЙ ОСЬ ЦЕ
+    B24_DOMAIN = os.getenv("B24_DOMAIN")  # приклад: fiberlink.bitrix24.eu
