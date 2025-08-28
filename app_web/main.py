@@ -161,7 +161,7 @@ async def team_set(c: types.CallbackQuery):
 
 
 # ===================== DIAGNOSTICS & BIND =====================
-@dp.message(Command("whoami")))
+@dp.message(Command("whoami"))
 async def whoami(m: types.Message):
     conn = await connect()
     u = await get_user(conn, m.from_user.id)
