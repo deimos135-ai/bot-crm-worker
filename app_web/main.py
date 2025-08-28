@@ -171,7 +171,7 @@ def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
-    await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal))
+    await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal),disable_web_page_preview=True)
 
 
 # ----------------------------- Simple binding storage ----------------------
