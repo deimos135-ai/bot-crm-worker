@@ -511,36 +511,44 @@ async def deals_for_team(m: types.Message):
 
 
 # ===================== DIAGNOSTИКА ПОЛІВ УГОДИ =====================
+# ========= DEBUG: raw deal dump =========
+from html import escape  # залишимо, якщо знадобиться в майбутньому
+
 @dp.message(Command("deal_dump"))
 async def deal_dump(m: types.Message):
     parts = (m.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await m.answer("Приклад: `/deal_dump 1138378`", parse_mode=ParseMode.MARKDOWN)
+    if len(parts) < 2:
+        await m.answer("Приклад: `/deal_dump 1109122`", parse_mode=ParseMode.MARKDOWN)
         return
-    did = int(parts[1])
+
+    raw = parts[1].lstrip("#")
+    if not raw.isdigit():
+        await m.answer("ID має бути числовим, напр.: `/deal_dump 1109122`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    deal_id = int(raw)
+
     try:
-        data = get_deal(did) or {}
+        d = get_deal(deal_id) or {}
     except Exception as e:
         await m.answer(f"Помилка отримання угоди: {e!s}")
         return
-    if not data:
-        await m.answer("Не знайшов угоду.")
-        return
 
-    keys = sorted(data.keys(), key=lambda k: (0 if str(k).startswith("UF_") else 1, str(k)))
-    lines = []
-    for k in keys:
-        v = data[k]
-        s = v
-        if isinstance(v, (list, dict)):
-            s = json.dumps(v, ensure_ascii=False)
-        s = str(s)
-        if len(s) > 300:
-            s = s[:300] + "…"
-        lines.append(f"{k}: {s}")
-    text = "```\n" + "\n".join(lines) + "\n```"
-    for chunk_start in range(0, len(text), 3500):
-        await m.answer(text[chunk_start:chunk_start+3500], parse_mode=ParseMode.MARKDOWN)
+    # Формуємо читаємий JSON з відступами
+    try:
+        pretty = json.dumps(d, ensure_ascii=False, indent=2)
+    except Exception:
+        pretty = str(d)
+
+    # Ріжемо на шматки < 3500 символів (з невеликим запасом)
+    max_len = 3500
+    start = 0
+    while start < len(pretty):
+        chunk = pretty[start:start + max_len]
+        start += max_len
+        # ВАЖЛИВО: без жодного parse_mode, щоби Telegram не намагався парсити Markdown/HTML
+        await m.answer(chunk)  # parse_mode=None за замовчуванням
+
 
 
 # ===================== QUICK TASK ACTIONS (slash) =====================
