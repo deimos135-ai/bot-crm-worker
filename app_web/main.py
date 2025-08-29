@@ -49,8 +49,7 @@ async def b24(method: str, **params) -> Any:
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
 _ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1602756048
 _TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1610558031277
-_FACT_ENUM_MAP: Optional[List[Tuple[str, str]]] = None  # list of (value_id, name)
-_TASK_RESULT_MAP: Optional[Dict[str, str]] = None
+_FACT_ENUM_MAP: Optional[List[Tuple[str, str]]] = None  # list of (option_id, label)
 
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -65,6 +64,7 @@ async def _enum_map_for_userfield(field_name: str) -> Dict[str, str]:
     options: Dict[str, str] = {}
     if uf and isinstance(uf.get("LIST"), list):
         for o in uf["LIST"]:
+            # для enum-ів у Bitrix: ID = option_id, VALUE = текст
             options[str(o["ID"])] = o["VALUE"]
     return options
 
@@ -82,37 +82,26 @@ async def get_tariff_enum_map() -> Dict[str, str]:
 
 async def get_fact_enum_list() -> List[Tuple[str, str]]:
     """
-    For UF_CRM_1602766787968: returns list of (VALUE, NAME) excluding 'не выбрано'.
-    We'll keep order as returned by Bitrix (SORT asc).
+    UF_CRM_1602766787968 — 'Що по факту зробили'
+    Повертає список (option_id, label) у правильному порядку (SORT ASC).
+    option_id = o['ID'] (його записуємо в угоду)
+    label     = o['VALUE'] (підпис на кнопці)
+    Пропускаємо 'не выбрано' (порожній VALUE/ID).
     """
     global _FACT_ENUM_MAP
     if _FACT_ENUM_MAP is None:
-        # fetch raw list to preserve order
         fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
         uf = next((f for f in fields if f.get("FIELD_NAME") == "UF_CRM_1602766787968"), None)
         lst: List[Tuple[str, str]] = []
         if uf and isinstance(uf.get("LIST"), list):
             for o in uf["LIST"]:
-                val = str(o.get("VALUE", ""))
-                name = str(o.get("NAME", ""))
-                if val == "":  # skip 'не выбрано'
+                opt_id = str(o.get("ID", "")).strip()
+                label = str(o.get("VALUE", "")).strip()
+                if not opt_id or not label:
                     continue
-                lst.append((val, name))
+                lst.append((opt_id, label))
         _FACT_ENUM_MAP = lst
     return _FACT_ENUM_MAP
-_TASK_RESULT_MAP: Optional[Dict[str, str]] = None
-
-async def get_task_result_map() -> Dict[str, str]:
-    global _TASK_RESULT_MAP
-    if _TASK_RESULT_MAP is None:
-        fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
-        uf = next((f for f in fields if f.get("FIELD_NAME") == "UF_CRM_1602766787968"), None)
-        options = {}
-        if uf and isinstance(uf.get("LIST"), list):
-            for o in uf["LIST"]:
-                options[str(o["ID"])] = o["VALUE"]
-        _TASK_RESULT_MAP = options
-    return _TASK_RESULT_MAP
 
 # ----------------------------- UI helpers ---------------------------------
 
@@ -252,16 +241,15 @@ _FACTS_PER_PAGE = 8
 
 def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
     """
-    facts: list of (value_id, name)
+    facts: list of (option_id, label)
     """
     start = page * _FACTS_PER_PAGE
     chunk = facts[start:start + _FACTS_PER_PAGE]
 
     rows: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
-    for val, name in chunk:
-        # each button selects a fact value
-        row.append(InlineKeyboardButton(text=name[:30], callback_data=f"factsel:{deal_id}:{val}"))
+    for opt_id, label in chunk:
+        row.append(InlineKeyboardButton(text=label[:30], callback_data=f"factsel:{deal_id}:{opt_id}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -291,7 +279,6 @@ async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: 
 
     # build COMMENTS append
     prev_comments = _strip_bb(deal.get("COMMENTS") or "")
-    author = f"@user_{user_id}"
     block = f"[p]<b>Закриття:</b> {html.escape(fact_name)}[/p]"
     if reason_text:
         block += f"\n[p]<b>Причина ремонту:</b> {html.escape(reason_text)}[/p]"
@@ -307,8 +294,8 @@ async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: 
     fields = {
         "STAGE_ID": target_stage,
         "COMMENTS": new_comments,
-        "UF_CRM_1602766787968": fact_val,            # Що по факту зробили (enum value id)
-        "UF_CRM_1702456465911": reason_text,         # Причина ремонту (free text)
+        "UF_CRM_1602766787968": fact_val,    # Що по факту зробили (enum option_id)
+        "UF_CRM_1702456465911": reason_text, # Причина ремонту (free text)
     }
     if exec_list:
         fields["UF_CRM_1611995532420"] = exec_list   # Виконавець (multi)
@@ -469,7 +456,7 @@ async def cb_fact_select(c: CallbackQuery):
         return
     deal_id, fact_val = parts[1], parts[2]
     facts = await get_fact_enum_list()
-    fact_name = next((n for v, n in facts if v == fact_val), "")
+    fact_name = next((name for val, name in facts if val == fact_val), "")
     if not fact_name:
         await c.message.answer("Не вдалося обрати значення.")
         return
