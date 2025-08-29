@@ -89,25 +89,6 @@ async def get_tariff_enum_map() -> Dict[str, str]:
 
 # ----------------------------- UI helpers ---------------------------------
 
-BR = "\n"
-
-
-def _strip_bb(text: str) -> str:
-    if not text:
-        return ""
-    t = re.sub(r"\[/?p\]", "", text, flags=re.I)
-    return t.strip()
-
-
-def _money_pair(val: Optional[str]) -> Optional[str]:
-    if not val:
-        return None
-    parts = str(val).split("|", 1)
-    if len(parts) == 2:
-        return f"{parts[0]} {parts[1]}"
-    return val
-
-
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -129,6 +110,22 @@ def pick_brigade_inline_kb() -> InlineKeyboardMarkup:
 
 
 # ----------------------------- Deal rendering ------------------------------
+
+def _strip_bb(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"\[/?p\]", "", text, flags=re.I)
+    return t.strip()
+
+
+def _money_pair(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    parts = str(val).split("|", 1)
+    if len(parts) == 2:
+        return f"{parts[0]} {parts[1]}"
+    return val
+
 
 async def render_deal_card(deal: Dict[str, Any]) -> str:
     deal_type_map = await get_deal_type_map()
@@ -191,9 +188,9 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         "",
         contact_line,
         "",
-        f"<a href=\"{link}\">Відкрити в CRM</a>",
+        f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
     ]
-    return f"<b>{head}</b>{BR*2}" + BR.join(body_lines)
+    return f"<b>{head}</b>\n\n" + "\n".join(body_lines)
 
 
 def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -214,7 +211,6 @@ async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
 
 # ----------------------------- Simple storage (brigade only) ---------------
 
-# Тепер зберігаємо лише номер бригади для telegram user id.
 _USER_BRIGADE: Dict[int, int] = {}
 
 
@@ -224,6 +220,60 @@ def get_user_brigade(user_id: int) -> Optional[int]:
 
 def set_user_brigade(user_id: int, brigade: int) -> None:
     _USER_BRIGADE[user_id] = brigade
+
+
+# ----------------------------- Close wizard with comment -------------------
+
+# Перелік “швидких причин” (кнопки). Ключ -> видимий текст.
+_QUICK_REASONS: Dict[str, str] = {
+    "done_ok": "Підключено та протестовано ✅",
+    "hw_installed": "Обладнання встановлено, все працює",
+    "client_moved": "Завдання виконано, клієнт задоволений",
+    "no_issues": "Без зауважень",
+    "other": "Ввести свій коментар…",
+}
+
+# Очікування текстового коментаря: user_id -> {"deal_id": str}
+_PENDING_COMMENT: Dict[int, Dict[str, str]] = {}
+
+
+def _close_wizard_kb(deal_id: str) -> InlineKeyboardMarkup:
+    rows = []
+    # по 2 в рядок
+    pair = []
+    for key, label in _QUICK_REASONS.items():
+        pair.append(InlineKeyboardButton(text=label, callback_data=f"cmtsel:{deal_id}:{key}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _finalize_close_with_comment(user_id: int, deal_id: str, comment_text: str) -> None:
+    """Append comment to COMMENTS and close to WON."""
+    # 1) отримати угоду
+    deal = await b24("crm.deal.get", id=deal_id)
+    if not deal:
+        raise RuntimeError("Deal not found")
+
+    # 2) зібрати оновлений COMMENTS (акуратно додаємо новий блок)
+    prev_comments = _strip_bb(deal.get("COMMENTS") or "")
+    author = f"@user_{user_id}"  # можна замінити на username, якщо він є у Telegram
+    new_block = f"[p]<b>Коментар закриття</b>: {html.escape(comment_text)} (від {html.escape(author)})[/p]"
+
+    new_comments = new_block if not prev_comments else f"{prev_comments}\n\n{new_block}"
+
+    # 3) закрити угоду у WON + записати COMMENTS
+    category = str(deal.get("CATEGORY_ID") or "0")
+    target_stage = f"C{category}:WON"
+    await b24(
+        "crm.deal.update",
+        id=deal_id,
+        fields={"STAGE_ID": target_stage, "COMMENTS": new_comments},
+    )
 
 
 # ----------------------------- Handlers ------------------------------------
@@ -315,15 +365,9 @@ async def msg_my_deals(m: Message):
         select=[
             "ID", "TITLE", "TYPE_ID", "CATEGORY_ID", "STAGE_ID",
             "COMMENTS", "CONTACT_ID",
-            # адреса
             "UF_CRM_6009542BC647F", "ADDRESS",
-            # роутер
-            "UF_CRM_1602756048",     # enum id
-            "UF_CRM_1604468981320",  # router price
-            # тариф
-            "UF_CRM_1610558031277",  # enum id
-            "UF_CRM_1611652685839",  # tariff price
-            # підключення (ціна)
+            "UF_CRM_1602756048", "UF_CRM_1604468981320",
+            "UF_CRM_1610558031277", "UF_CRM_1611652685839",
             "UF_CRM_1609868447208",
         ],
     )
@@ -366,20 +410,83 @@ async def deal_dump(m: Message):
     await send_deal_card(m.chat.id, deal)
 
 
+# ======== МАЙСТЕР ЗАКРИТТЯ З КОМЕНТАРЕМ ========
+
 @dp.callback_query(F.data.startswith("close:"))
-async def cb_close_deal(c: CallbackQuery):
+async def cb_close_deal_start(c: CallbackQuery):
+    """Початок майстра: показати варіанти коментарів/ввід свого."""
     await c.answer()
     deal_id = c.data.split(":", 1)[1]
-    deal = await b24("crm.deal.get", id=deal_id)
-    if not deal:
-        await c.message.answer("❗️Не знайшов угоду.")
+    _PENDING_COMMENT[c.from_user.id] = {"deal_id": deal_id}
+    await c.message.answer(
+        f"Закриваємо угоду #{deal_id}. Оберіть коментар або введіть свій текст повідомлення одним наступним повідомленням:",
+        reply_markup=_close_wizard_kb(deal_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("cmtsel:"))
+async def cb_close_deal_quick(c: CallbackQuery):
+    """Клік по готовому варіанту (включно з «Ввести свій коментар…»)."""
+    await c.answer()
+    parts = c.data.split(":")
+    # cmtsel:{deal_id}:{key}
+    if len(parts) < 3:
         return
-    category = str(deal.get("CATEGORY_ID") or "0")
-    target_stage = f"C{category}:WON"
-    await b24("crm.deal.update", id=deal_id, fields={"STAGE_ID": target_stage})
-    await c.message.answer(f"✅ Угоду #{deal_id} закрито у статусі WON.")
-    deal2 = await b24("crm.deal.get", id=deal_id)
-    await send_deal_card(c.message.chat.id, deal2)
+    deal_id, key = parts[1], parts[2]
+
+    if key == "other":
+        # просимо ввести текст
+        _PENDING_COMMENT[c.from_user.id] = {"deal_id": deal_id}
+        await c.message.answer("Введіть ваш коментар одним повідомленням ⌨️")
+        return
+
+    # беремо текст з пресетів і закриваємо
+    text = _QUICK_REASONS.get(key, "").strip()
+    if not text:
+        await c.message.answer("Не вдалося прочитати коментар.")
+        return
+
+    try:
+        await _finalize_close_with_comment(c.from_user.id, deal_id, text)
+        await c.message.answer(f"✅ Угоду #{deal_id} закрито. Коментар додано.")
+        deal2 = await b24("crm.deal.get", id=deal_id)
+        await send_deal_card(c.message.chat.id, deal2)
+    except Exception as e:
+        log.exception("close with quick comment failed")
+        await c.message.answer(f"❗️Помилка закриття: {e}")
+    finally:
+        _PENDING_COMMENT.pop(c.from_user.id, None)
+
+
+@dp.callback_query(F.data.startswith("cmtcancel:"))
+async def cb_close_deal_cancel(c: CallbackQuery):
+    await c.answer("Скасовано")
+    _PENDING_COMMENT.pop(c.from_user.id, None)
+    await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
+
+
+# Текст наступним повідомленням — це власний коментар користувача
+@dp.message()
+async def catch_free_text(m: Message):
+    ctx = _PENDING_COMMENT.get(m.from_user.id)
+    if not ctx:
+        return  # це не коментар до закриття — інші хендлери вже спрацювали вище
+    deal_id = ctx.get("deal_id")
+    text = (m.text or "").strip()
+    if not text:
+        await m.answer("Порожній коментар. Введіть текст або натисніть «❌ Скасувати».")
+        return
+
+    try:
+        await _finalize_close_with_comment(m.from_user.id, deal_id, text)
+        await m.answer(f"✅ Угоду #{deal_id} закрито. Коментар додано.")
+        deal2 = await b24("crm.deal.get", id=deal_id)
+        await send_deal_card(m.chat.id, deal2)
+    except Exception as e:
+        log.exception("close with custom comment failed")
+        await m.answer(f"❗️Помилка закриття: {e}")
+    finally:
+        _PENDING_COMMENT.pop(m.from_user.id, None)
 
 
 # ----------------------------- Webhook plumbing ----------------------------
@@ -389,7 +496,7 @@ async def on_startup():
     global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
-    # Команди бота (видимі у Bot Menu). Без /bind.
+    # Команди бота
     await bot.set_my_commands([
         BotCommand(command="start", description="Почати"),
         BotCommand(command="menu", description="Показати меню"),
