@@ -258,18 +258,13 @@ def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> Inl
     start = page * _FACTS_PER_PAGE
     chunk = facts[start:start + _FACTS_PER_PAGE]
 
-    # ОДИН рядок з кнопками (для читабельності підпишемо коротко)
-    row: List[InlineKeyboardButton] = []
-    for val, name in chunk:
-        text = name
-        if len(text) > 20:
-            text = text[:19] + "…"
-        row.append(InlineKeyboardButton(text=text, callback_data=f"factsel:{deal_id}:{val}"))
-
+    # кожна опція — окремий рядок
     rows: List[List[InlineKeyboardButton]] = []
-    if row:
-        rows.append(row)
+    for val, name in chunk:
+        text = name if len(name) <= 32 else (name[:31] + "…")
+        rows.append([InlineKeyboardButton(text=text, callback_data=f"factsel:{deal_id}:{val}")])
 
+    # навігація
     total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
     nav: List[InlineKeyboardButton] = []
     if page > 0:
@@ -281,6 +276,7 @@ def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> Inl
 
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
     deal = await b24("crm.deal.get", id=deal_id)
