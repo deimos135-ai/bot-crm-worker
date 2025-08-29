@@ -50,6 +50,7 @@ _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
 _ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1602756048
 _TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1610558031277
 _FACT_ENUM_MAP: Optional[List[Tuple[str, str]]] = None  # list of (value_id, name)
+_TASK_RESULT_MAP: Optional[Dict[str, str]] = None
 
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -99,6 +100,19 @@ async def get_fact_enum_list() -> List[Tuple[str, str]]:
                 lst.append((val, name))
         _FACT_ENUM_MAP = lst
     return _FACT_ENUM_MAP
+_TASK_RESULT_MAP: Optional[Dict[str, str]] = None
+
+async def get_task_result_map() -> Dict[str, str]:
+    global _TASK_RESULT_MAP
+    if _TASK_RESULT_MAP is None:
+        fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
+        uf = next((f for f in fields if f.get("FIELD_NAME") == "UF_CRM_1602766787968"), None)
+        options = {}
+        if uf and isinstance(uf.get("LIST"), list):
+            for o in uf["LIST"]:
+                options[str(o["ID"])] = o["VALUE"]
+        _TASK_RESULT_MAP = options
+    return _TASK_RESULT_MAP
 
 # ----------------------------- UI helpers ---------------------------------
 
