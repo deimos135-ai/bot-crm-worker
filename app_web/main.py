@@ -273,7 +273,7 @@ _BRIGADE_EXEC_OPTION_ID = {
 
 _PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
 
-_FACTS_PER_PAGE = 8  # скільки пунктів на сторінку
+_FACTS_PER_PAGE = 6  # скільки пунктів на сторінку
 
 
 def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
