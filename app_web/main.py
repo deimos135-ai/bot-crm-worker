@@ -3,7 +3,7 @@ import html
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -45,13 +45,30 @@ async def b24(method: str, **params) -> Any:
             raise RuntimeError(f"B24 error: {data['error']}: {data.get('error_description')}")
         return data.get("result")
 
+async def b24_list_all(method: str, **params) -> List[Any]:
+    """Bitrix list pagination helper (accumulates all results)."""
+    out: List[Any] = []
+    start = 0
+    while True:
+        batch = await b24(method, start=start, **params)
+        if isinstance(batch, dict) and "result" in batch:
+            # just in case (some endpoints wrap)
+            items = batch["result"]
+        else:
+            items = batch or []
+        out.extend(items)
+        # Bitrix 'next' pagination: if exactly 50 items returned -> there may be more
+        if not isinstance(items, list) or len(items) < 50:
+            break
+        start += 50
+    return out
+
 # ----------------------------- Caches -------------------------------------
 
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
 _ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1602756048
 _TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1610558031277
 _FACT_ENUM_LIST: Optional[List[Tuple[str, str]]] = None  # list of (value_id, name)
-_FACT_ENUM_MAP: Optional[Dict[str, str]] = None          # value_id -> name (для швидкого пошуку)
 
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -66,7 +83,6 @@ async def _enum_map_for_userfield(field_name: str) -> Dict[str, str]:
     options: Dict[str, str] = {}
     if uf and isinstance(uf.get("LIST"), list):
         for o in uf["LIST"]:
-            # У Bitrix у LIST є {"ID": "...", "VALUE": "Назва", ...}
             options[str(o["ID"])] = o["VALUE"]
     return options
 
@@ -83,33 +99,21 @@ async def get_tariff_enum_map() -> Dict[str, str]:
     return _TARIFF_ENUM_MAP
 
 async def get_fact_enum_list() -> List[Tuple[str, str]]:
-    """
-    UF_CRM_1602766787968: повертає відсортований список (VALUE, NAME), без 'не выбрано'.
-    """
-    global _FACT_ENUM_LIST, _FACT_ENUM_MAP
+    """UF_CRM_1602766787968 → list of (VALUE, NAME) excluding empty 'не выбрано'."""
+    global _FACT_ENUM_LIST
     if _FACT_ENUM_LIST is None:
         fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
         uf = next((f for f in fields if f.get("FIELD_NAME") == "UF_CRM_1602766787968"), None)
         lst: List[Tuple[str, str]] = []
-        mp: Dict[str, str] = {}
         if uf and isinstance(uf.get("LIST"), list):
             for o in uf["LIST"]:
-                # у списку «не выбрано» зазвичай має VALUE == "" — пропускаємо
-                val = str(o.get("ID") or o.get("VALUE") or "")
-                name = str(o.get("VALUE") or o.get("NAME") or "")
-                if not val or name.lower().startswith("не вибрано") or name.lower().startswith("не выбрано"):
+                val = str(o.get("VALUE", ""))
+                name = str(o.get("NAME", ""))
+                if val == "":
                     continue
                 lst.append((val, name))
-                mp[val] = name
         _FACT_ENUM_LIST = lst
-        _FACT_ENUM_MAP = mp
     return _FACT_ENUM_LIST
-
-def fact_value_to_name(value_id: str) -> str:
-    global _FACT_ENUM_MAP
-    if _FACT_ENUM_MAP is None:
-        return value_id
-    return _FACT_ENUM_MAP.get(str(value_id), str(value_id))
 
 # ----------------------------- UI helpers ---------------------------------
 
@@ -119,15 +123,16 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📦 Мої угоди")],
             [KeyboardButton(text="📋 Мої задачі")],
             [KeyboardButton(text="📊 Звіт за сьогодні")],
-            [KeyboardButton(text="📊 Звіт за вчора")],
+            [KeyboardButton(text="📉 Звіт за вчора")],
         ],
         resize_keyboard=True,
-        one_time_keyboard=False,
-        selective=False,
     )
 
 def pick_brigade_inline_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=f"Бригада №{i}", callback_data=f"setbrig:{i}")] for i in (1, 2, 3, 4, 5)]
+    rows = [
+        [InlineKeyboardButton(text=f"Бригада №{i}", callback_data=f"setbrig:{i}")]
+        for i in (1, 2, 3, 4, 5)
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ----------------------------- Deal rendering ------------------------------
@@ -152,7 +157,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
     tariff_map = await get_tariff_enum_map()
 
     deal_id = deal.get("ID")
-    title = deal.get("TITLE") or f"Угода #{deal_id}"
+    title = deal.get("TITLE") or f"Deal #{deal_id}"
     type_code = deal.get("TYPE_ID") or ""
     type_name = deal_type_map.get(type_code, type_code or "—")
     category = deal.get("CATEGORY_ID", "—")
@@ -239,8 +244,8 @@ _BRIGADE_EXEC_OPTION_ID = {
     5: 5502,
 }
 
-# mapping brigade -> stage code within C20
-_BRIGADE_STAGE_CODE = {
+# mapping brigade -> stage code in C20
+_BRIGADE_STAGE = {
     1: "UC_XF8O6V",
     2: "UC_0XLPCN",
     3: "UC_204CP3",
@@ -251,20 +256,17 @@ _BRIGADE_STAGE_CODE = {
 # ----------------------------- Close wizard (fact + reason) ----------------
 
 _PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
-
-_FACTS_PER_PAGE = 8
+_FACTS_PER_PAGE = 8  # сторінка пагінації, але тепер кожен елемент в окремому рядку
 
 def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
     start = page * _FACTS_PER_PAGE
     chunk = facts[start:start + _FACTS_PER_PAGE]
 
-    # кожна опція — окремий рядок
     rows: List[List[InlineKeyboardButton]] = []
     for val, name in chunk:
-        text = name if len(name) <= 32 else (name[:31] + "…")
-        rows.append([InlineKeyboardButton(text=text, callback_data=f"factsel:{deal_id}:{val}")])
+        # КОЖНА КНОПКА — В ОКРЕМОМУ РЯДКУ (видно повний текст)
+        rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
 
-    # навігація
     total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
     nav: List[InlineKeyboardButton] = []
     if page > 0:
@@ -276,7 +278,6 @@ def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> Inl
 
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
     deal = await b24("crm.deal.get", id=deal_id)
@@ -299,13 +300,86 @@ async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: 
     fields = {
         "STAGE_ID": target_stage,
         "COMMENTS": new_comments,
-        "UF_CRM_1602766787968": fact_val,     # Що по факту зробили
-        "UF_CRM_1702456465911": reason_text,  # Причина ремонту
+        "UF_CRM_1602766787968": fact_val,
+        "UF_CRM_1702456465911": reason_text,
     }
     if exec_list:
         fields["UF_CRM_1611995532420"] = exec_list
 
     await b24("crm.deal.update", id=deal_id, fields=fields)
+
+# ----------------------------- Report helpers ------------------------------
+
+def _day_range(offset_days: int = 0) -> Tuple[str, str]:
+    """
+    Returns [from, to) ISO strings for CLOSED_DATE filter.
+    offset_days=0 -> today, 1 -> yesterday, etc.
+    """
+    d = date.today() - timedelta(days=offset_days)
+    d2 = d + timedelta(days=1)
+    return f"{d.isoformat()}T00:00:00", f"{d2.isoformat()}T00:00:00"
+
+async def _count_open_in_brigade(brigade: int) -> int:
+    stage = _BRIGADE_STAGE.get(brigade)
+    if not stage:
+        return 0
+    # count all open deals in that column
+    items = await b24_list_all(
+        "crm.deal.list",
+        filter={"CLOSED": "N", "STAGE_ID": f"C20:{stage}"},
+        select=["ID"],
+    )
+    return len(items)
+
+async def _report_for_day(user_id: int, brigade: int, offset_days: int) -> str:
+    if brigade not in _BRIGADE_EXEC_OPTION_ID:
+        return "Невірний номер бригади."
+
+    from_iso, to_iso = _day_range(offset_days)
+    exec_id = _BRIGADE_EXEC_OPTION_ID[brigade]
+
+    # всі успішно закриті угоди за період, де у полі “Виконавець” є наша бригада
+    deals = await b24_list_all(
+        "crm.deal.list",
+        filter={
+            "STAGE_SEMANTIC_ID": "S",  # success (WON) у всіх категоріях
+            ">=CLOSED_DATE": from_iso,
+            "<CLOSED_DATE": to_iso,
+            "UF_CRM_1611995532420": exec_id,
+        },
+        select=["ID", "TYPE_ID"],
+        order={"ID": "DESC"},
+    )
+
+    total = len(deals)
+    type_map = await get_deal_type_map()
+
+    # групування за типом угоди
+    by_type: Dict[str, int] = {}
+    for d in deals:
+        tcode = d.get("TYPE_ID") or ""
+        tname = type_map.get(tcode, tcode or "Інше")
+        by_type[tname] = by_type.get(tname, 0) + 1
+
+    # відкриті в колонці бригади на зараз
+    open_left = await _count_open_in_brigade(brigade)
+
+    # заголовок дати
+    d = date.today() - timedelta(days=offset_days)
+    date_str = d.strftime("%d.%m.%Y")
+
+    lines = [
+        f"📊 <b>Звіт за {date_str}</b>",
+        f"Бригада №{brigade}",
+        "",
+        f"Закрито угод: <b>{total}</b>",
+    ]
+    if by_type:
+        for name, cnt in sorted(by_type.items(), key=lambda x: x[0]):
+            lines.append(f" • {name} — {cnt}")
+    lines.append("")
+    lines.append(f"Активних задач залишилось: <b>{open_left}</b>")
+    return "\n".join(lines)
 
 # ----------------------------- Handlers ------------------------------------
 
@@ -364,7 +438,7 @@ async def msg_my_deals(m: Message):
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
-    stage_code = _BRIGADE_STAGE_CODE.get(brigade)
+    stage_code = _BRIGADE_STAGE.get(brigade)
     if not stage_code:
         await m.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
         return
@@ -383,7 +457,8 @@ async def msg_my_deals(m: Message):
             "UF_CRM_1610558031277", "UF_CRM_1611652685839",
             "UF_CRM_1609868447208",
         ],
-    )
+    ) or []
+
     if not deals:
         await m.answer("Немає активних угод.", reply_markup=main_menu_kb())
         return
@@ -399,22 +474,6 @@ async def cb_my_deals(c: CallbackQuery):
 async def msg_tasks(m: Message):
     await m.answer("Задачі ще в розробці 🛠️", reply_markup=main_menu_kb())
 
-@dp.message(Command("deal_dump"))
-async def deal_dump(m: Message):
-    mtext = (m.text or "").strip()
-    m2 = re.search(r"(\d+)", mtext)
-    if not m2:
-        await m.answer("Вкажіть ID угоди: /deal_dump 12345", reply_markup=main_menu_kb())
-        return
-    deal_id = m2.group(1)
-    deal = await b24("crm.deal.get", id=deal_id)
-    if not deal:
-        await m.answer("Не знайшов угоду.", reply_markup=main_menu_kb())
-        return
-    pretty = html.escape(json.dumps(deal, ensure_ascii=False, indent=2))
-    await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>", reply_markup=main_menu_kb())
-    await send_deal_card(m.chat.id, deal)
-
 # ======== МАЙСТЕР ЗАКРИТТЯ: вибір факту + причина ==========
 
 @dp.callback_query(F.data.startswith("close:"))
@@ -424,7 +483,7 @@ async def cb_close_deal_start(c: CallbackQuery):
     facts = await get_fact_enum_list()
     _PENDING_CLOSE[c.from_user.id] = {"deal_id": deal_id, "stage": "pick_fact", "page": 0}
     await c.message.answer(
-        f"Закриваємо угоду #{deal_id}. Оберіть, що зроблено:",
+        f"Закриваємо угоду <a href=\"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/\">#{deal_id}</a>. Оберіть, що зроблено:",
         reply_markup=_facts_page_kb(deal_id, 0, facts),
     )
 
@@ -468,7 +527,7 @@ async def cb_fact_select(c: CallbackQuery):
         [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")],
     ])
     await c.message.answer(
-        f"Обрано: <b>{html.escape(fact_name)}</b>\nВведіть причину ремонту одним повідомленням, або натисніть «Пропустити».",
+        f"Обрано: <b>{html.escape(fact_name)}</b>\nВведіть причину ремонту одним повідомленням або натисніть «Пропустити».",
         reply_markup=kb,
     )
 
@@ -521,122 +580,31 @@ async def catch_free_text(m: Message):
 
 # ----------------------------- Reports -------------------------------------
 
-def _today_range_utc(tz_offset_hours: int = 0) -> Tuple[datetime, datetime]:
-    now = datetime.now(timezone.utc) + timedelta(hours=tz_offset_hours)
-    start_local = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=1)
-    # назад у UTC:
-    start_utc = start_local - timedelta(hours=tz_offset_hours)
-    end_utc = end_local - timedelta(hours=tz_offset_hours)
-    return start_utc.replace(tzinfo=None), end_utc.replace(tzinfo=None)
-
-def _yesterday_range_utc(tz_offset_hours: int = 0) -> Tuple[datetime, datetime]:
-    start_today, _ = _today_range_utc(tz_offset_hours)
-    start_y = start_today - timedelta(days=1)
-    end_y = start_today
-    return start_y, end_y
-
-async def _report_for_range(user_id: int, start_dt: datetime, end_dt: datetime) -> str:
-    brigade = get_user_brigade(user_id)
-    if not brigade:
-        return "Спершу оберіть бригаду."
-
-    deal_type_map = await get_deal_type_map()
-
-    # фільтр на закриті цією бригадою за діапазон CLOSEDATE
-    filt = {
-        "CLOSED": "Y",
-        "STAGE_SEMANTIC_ID": "S",  # успішно закриті
-        ">=CLOSEDATE": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-        "<=CLOSEDATE": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    exec_id = _BRIGADE_EXEC_OPTION_ID.get(brigade)
-    if exec_id:
-        # мультиполе: у Bitrix достатньо передати одне значення
-        filt["UF_CRM_1611995532420"] = exec_id
-
-    closed: List[Dict[str, Any]] = await b24(
-        "crm.deal.list",
-        filter=filt,
-        select=[
-            "ID", "TITLE", "TYPE_ID", "CLOSEDATE",
-            "UF_CRM_1602766787968",  # факт
-        ],
-        order={"CLOSEDATE": "ASC"},
-    )
-
-    # активні в колонці бригади (поточний момент)
-    stage_code = _BRIGADE_STAGE_CODE.get(brigade)
-    active_cnt = 0
-    if stage_code:
-        act = await b24(
-            "crm.deal.list",
-            filter={"CLOSED": "N", "STAGE_ID": f"C20:{stage_code}"},
-            select=["ID"],
-        )
-        active_cnt = len(act or [])
-
-    total = len(closed or [])
-    cnt_p = cnt_s = cnt_r = cnt_a = 0
-
-    # гарантуємо наявність мапи фактів
-    await get_fact_enum_list()
-
-    for d in closed or []:
-        tcode = d.get("TYPE_ID") or ""
-        tname = deal_type_map.get(tcode, tcode)
-        if tname.lower().startswith("підключ"):
-            cnt_p += 1
-        elif tname.lower().startswith("сервіс"):
-            cnt_s += 1
-        elif tname.lower().startswith("ремонт"):
-            fval = str(d.get("UF_CRM_1602766787968") or "")
-            fname = fact_value_to_name(fval)
-            if fname.lower().startswith("авар"):
-                cnt_a += 1
-            else:
-                cnt_r += 1
-        else:
-            cnt_s += 1
-
-    # дата для відображення (Київ +3)
-    date_label = (start_dt + timedelta(hours=3)).strftime("%d.%m.%Y")
-    lines = [
-        f"<b>Бригада №{brigade} {date_label}</b>",
-        "",
-        f"<b>Закрито задач:</b> {total}",
-        "",
-        f"Аварії — {cnt_a}",
-        f"Ремонти — {cnt_r}",
-        f"Підключення — {cnt_p}",
-        f"Сервісні роботи — {cnt_s}",
-        "",
-        f"<b>Залишилось активних у колонці бригади:</b> {active_cnt}",
-    ]
-    return "\n".join(lines)
-
-
 @dp.message(F.text == "📊 Звіт за сьогодні")
-@dp.message(Command("report_today"))
 async def report_today(m: Message):
-    start_dt, end_dt = _today_range_utc(tz_offset_hours=3)  # якщо працюєте по Києву
+    brigade = get_user_brigade(m.from_user.id)
+    if not brigade:
+        await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
+        return
     try:
-        text = await _report_for_range(m.from_user.id, start_dt, end_dt)
-        await m.answer(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+        txt = await _report_for_day(m.from_user.id, brigade, offset_days=0)
+        await m.answer(txt, reply_markup=main_menu_kb())
     except Exception as e:
-        log.exception("report_today failed")
-        await m.answer(f"❗️Помилка побудови звіту: {e}", reply_markup=main_menu_kb())
+        log.exception("report today failed")
+        await m.answer(f"❗️Помилка формування звіту: {e}")
 
-@dp.message(F.text == "📊 Звіт за вчора")
-@dp.message(Command("report_yesterday"))
+@dp.message(F.text == "📉 Звіт за вчора")
 async def report_yesterday(m: Message):
-    start_dt, end_dt = _yesterday_range_utc(tz_offset_hours=3)
+    brigade = get_user_brigade(m.from_user.id)
+    if not brigade:
+        await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
+        return
     try:
-        text = await _report_for_range(m.from_user.id, start_dt, end_dt)
-        await m.answer(text, reply_markup=main_menu_kb(), disable_web_page_preview=True)
+        txt = await _report_for_day(m.from_user.id, brigade, offset_days=1)
+        await m.answer(txt, reply_markup=main_menu_kb())
     except Exception as e:
-        log.exception("report_yesterday failed")
-        await m.answer(f"❗️Помилка побудови звіту: {e}", reply_markup=main_menu_kb())
+        log.exception("report yesterday failed")
+        await m.answer(f"❗️Помилка формування звіту: {e}")
 
 # ----------------------------- Webhook plumbing ----------------------------
 
@@ -650,8 +618,6 @@ async def on_startup():
         BotCommand(command="menu", description="Показати меню"),
         BotCommand(command="set_brigade", description="Вибрати бригаду"),
         BotCommand(command="deal_dump", description="Показати dump угоди"),
-        BotCommand(command="report_today", description="Звіт за сьогодні"),
-        BotCommand(command="report_yesterday", description="Звіт за вчора"),
     ])
 
     url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
