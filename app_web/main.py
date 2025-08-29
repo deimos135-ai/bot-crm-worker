@@ -542,22 +542,30 @@ async def _report_for_range(user_id: int, start_dt: datetime, end_dt: datetime) 
         return "Спершу оберіть бригаду."
 
     deal_type_map = await get_deal_type_map()
-    # Всі закриті як WON у цей проміжок
+
+    # фільтр на закриті цією бригадою за діапазон CLOSEDATE
+    filt = {
+        "CLOSED": "Y",
+        "STAGE_SEMANTIC_ID": "S",  # успішно закриті
+        ">=CLOSEDATE": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        "<=CLOSEDATE": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    exec_id = _BRIGADE_EXEC_OPTION_ID.get(brigade)
+    if exec_id:
+        # мультиполе: у Bitrix достатньо передати одне значення
+        filt["UF_CRM_1611995532420"] = exec_id
+
     closed: List[Dict[str, Any]] = await b24(
         "crm.deal.list",
-        filter={
-            "STAGE_ID": "C20:WON",
-            ">=DATE_MODIFY": start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-            "<=DATE_MODIFY": end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-        },
+        filter=filt,
         select=[
-            "ID", "TITLE", "TYPE_ID", "DATE_MODIFY",
+            "ID", "TITLE", "TYPE_ID", "CLOSEDATE",
             "UF_CRM_1602766787968",  # факт
         ],
-        order={"DATE_MODIFY": "ASC"},
+        order={"CLOSEDATE": "ASC"},
     )
 
-    # Рахуємо активні у колонці бригади (на кінець звітного періоду: приблизно — зараз)
+    # активні в колонці бригади (поточний момент)
     stage_code = _BRIGADE_STAGE_CODE.get(brigade)
     active_cnt = 0
     if stage_code:
@@ -568,15 +576,11 @@ async def _report_for_range(user_id: int, start_dt: datetime, end_dt: datetime) 
         )
         active_cnt = len(act or [])
 
-    # Розбивка
     total = len(closed or [])
-    cnt_p = 0   # Підключення
-    cnt_s = 0   # Сервісні роботи
-    cnt_r = 0   # Ремонти
-    cnt_a = 0   # Аварії (ремонти з фактом «Аварійні роботи»)
+    cnt_p = cnt_s = cnt_r = cnt_a = 0
 
-    # підготуємо map факту
-    await get_fact_enum_list()  # заповнить _FACT_ENUM_MAP
+    # гарантуємо наявність мапи фактів
+    await get_fact_enum_list()
 
     for d in closed or []:
         tcode = d.get("TYPE_ID") or ""
@@ -586,7 +590,6 @@ async def _report_for_range(user_id: int, start_dt: datetime, end_dt: datetime) 
         elif tname.lower().startswith("сервіс"):
             cnt_s += 1
         elif tname.lower().startswith("ремонт"):
-            # перевіримо факт
             fval = str(d.get("UF_CRM_1602766787968") or "")
             fname = fact_value_to_name(fval)
             if fname.lower().startswith("авар"):
@@ -594,10 +597,10 @@ async def _report_for_range(user_id: int, start_dt: datetime, end_dt: datetime) 
             else:
                 cnt_r += 1
         else:
-            # інші типи — зарахуємо у «Сервісні роботи»
             cnt_s += 1
 
-    date_label = (start_dt + timedelta(hours=3)).strftime("%d.%m.%Y")  # для UA часу можна підкрутити
+    # дата для відображення (Київ +3)
+    date_label = (start_dt + timedelta(hours=3)).strftime("%d.%m.%Y")
     lines = [
         f"<b>Бригада №{brigade} {date_label}</b>",
         "",
@@ -611,6 +614,7 @@ async def _report_for_range(user_id: int, start_dt: datetime, end_dt: datetime) 
         f"<b>Залишилось активних у колонці бригади:</b> {active_cnt}",
     ]
     return "\n".join(lines)
+
 
 @dp.message(F.text == "📊 Звіт за сьогодні")
 @dp.message(Command("report_today"))
