@@ -540,27 +540,43 @@ async def _paged_deal_list(**kwargs) -> List[Dict[str, Any]]:
         start += 50
     return out
 
+# --- ЗАМІНИ ФУНКЦІЮ _report_for_day НА ЦЮ -------------------
+
 async def _report_for_day(user_id: int, delta_days: int) -> str:
     brigade = get_user_brigade(user_id)
     if not brigade:
         return "Спершу оберіть бригаду."
 
-    # закриті за добу (WON + CLOSEDATE у межах дня) + виконавець = бригада
     start, end = _day_bounds_utc(delta_days)
     exec_id = _BRIGADE_EXEC_OPTION_ID.get(brigade)
+    exec_id_str = str(exec_id) if exec_id is not None else None
 
+    # 1) Закриті за день (спроба №1 — точний WON у категорії 20)
     closed = await _paged_deal_list(
         filter={
             "STAGE_ID": "C20:WON",
             ">=CLOSEDATE": start,
             "<=CLOSEDATE": end,
-            "UF_CRM_1611995532420": exec_id,  # multi-select: фільтр приймає одне значення
+            # мультиполе: найкраще працює порівняння по одному значенню
+            "UF_CRM_1611995532420": exec_id_str,
         },
         select=["ID", "TITLE", "TYPE_ID"],
         order={"ID": "DESC"},
     )
 
-    # підрахунок по типах
+    # fallback: якщо раптом у вас інший WON/категорія
+    if not closed:
+        closed = await _paged_deal_list(
+            filter={
+                "STAGE_SEMANTIC_ID": "S",       # S = success (WON)
+                ">=CLOSEDATE": start,
+                "<=CLOSEDATE": end,
+                "UF_CRM_1611995532420": exec_id_str,
+            },
+            select=["ID", "TITLE", "TYPE_ID"],
+            order={"ID": "DESC"},
+        )
+
     type_map = await get_deal_type_map()
     buckets: Dict[str, int] = {}
     for d in closed:
@@ -570,7 +586,7 @@ async def _report_for_day(user_id: int, delta_days: int) -> str:
 
     total_closed = len(closed)
 
-    # скільки ще активних у колонці бригади
+    # активні ще висять у колонці бригади
     stage_code = {
         1: "UC_XF8O6V",
         2: "UC_0XLPCN",
@@ -585,25 +601,22 @@ async def _report_for_day(user_id: int, delta_days: int) -> str:
     )
     active_cnt = len(active)
 
-    # формуємо текст
     day_label = (datetime.now().date() + timedelta(days=delta_days)).strftime("%d.%m.%Y")
     lines = [
         f"<b>Бригада {brigade}</b> — {day_label}",
         "",
         f"<b>Закрито задач:</b> {total_closed}",
     ]
-    # показуємо популярні типи групами
     wanted = ["Аварії", "Ремонт", "Підключення", "Сервісні роботи"]
     for w in wanted:
         if buckets.get(w):
             lines.append(f"{w} — {buckets[w]}")
-    # інше
     other_sum = sum(v for k, v in buckets.items() if k not in wanted)
     if other_sum:
         lines.append(f"Інше — {other_sum}")
-
     lines += ["", f"<b>Активних задач на бригаді:</b> {active_cnt}"]
     return "\n".join(lines)
+
 
 @dp.message(F.text == "📊 Звіт за сьогодні")
 async def report_today(m: Message):
