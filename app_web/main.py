@@ -195,6 +195,16 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         except Exception as e:
             log.warning("contact.get failed: %s", e)
 
+    # ── НОВЕ: показуємо “Що зроблено” + “Причина ремонту” ───────────────────
+    fact_val = str(deal.get("UF_CRM_1602766787968") or "")
+    fact_name = "—"
+    if fact_val:
+        facts = await get_fact_enum_list()
+        fact_name = next((name for val, name in facts if val == fact_val), fact_val)
+
+    reason_text = (deal.get("UF_CRM_1702456465911") or "").strip() or "—"
+    # ──────────────────────────────────────────────────────────────────────────
+
     head = f"#{deal_id} • {html.escape(title)}"
     link = f"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/"
 
@@ -216,11 +226,15 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         "",
         f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
         "",
+        f"<b>Що зроблено:</b> {html.escape(fact_name)}",         # ← нове
+        f"<b>Причина ремонту:</b> {html.escape(reason_text)}",   # ← нове
+        "",
         contact_line,
         "",
-        f"<a href=\"{link}\">Відкрити в Bitrix24</a>",
+        f"<a href=\"{link}\">Відкрити в CRM</a>",
     ]
     return f"<b>{head}</b>\n\n" + "\n".join(body_lines)
+
 
 def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
     deal_id = str(deal.get("ID"))
@@ -461,6 +475,9 @@ async def msg_my_deals(m: Message):
             "UF_CRM_1602756048", "UF_CRM_1604468981320",
             "UF_CRM_1610558031277", "UF_CRM_1611652685839",
             "UF_CRM_1609868447208",
+            # ── додано для відображення у картці ──
+            "UF_CRM_1602766787968",     # Що зроблено
+            "UF_CRM_1702456465911",     # Причина ремонту
         ],
         page_size=100,
     )
