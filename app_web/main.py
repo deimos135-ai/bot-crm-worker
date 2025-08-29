@@ -242,20 +242,21 @@ _FACTS_PER_PAGE = 8
 def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
     """
     facts: list of (option_id, label)
+    Тепер кожна опція = окрема кнопка в окремому рядку.
     """
     start = page * _FACTS_PER_PAGE
     chunk = facts[start:start + _FACTS_PER_PAGE]
 
     rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
     for opt_id, label in chunk:
-        row.append(InlineKeyboardButton(text=label[:30], callback_data=f"factsel:{deal_id}:{opt_id}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+        rows.append([
+            InlineKeyboardButton(
+                text=label,  # повний текст, не обрізаємо
+                callback_data=f"factsel:{deal_id}:{opt_id}"
+            )
+        ])
 
+    # пагінація
     nav: List[InlineKeyboardButton] = []
     total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
     if page > 0:
@@ -268,6 +269,7 @@ def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> Inl
 
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
     # get deal and category
