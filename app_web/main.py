@@ -3,7 +3,7 @@ import html
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -36,9 +36,7 @@ dp = Dispatcher()
 B24_BASE = settings.BITRIX_WEBHOOK_BASE.rstrip("/")
 HTTP: aiohttp.ClientSession
 
-
 async def b24(method: str, **params) -> Any:
-    """Call Bitrix REST method."""
     url = f"{B24_BASE}/{method}.json"
     async with HTTP.post(url, json=params) as resp:
         data = await resp.json()
@@ -46,13 +44,12 @@ async def b24(method: str, **params) -> Any:
             raise RuntimeError(f"B24 error: {data['error']}: {data.get('error_description')}")
         return data.get("result")
 
-
 # ----------------------------- Caches -------------------------------------
 
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
-_ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None     # UF_CRM_1602756048 optionId -> text
-_TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None     # UF_CRM_1610558031277 optionId -> text
-
+_ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1602756048
+_TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1610558031277
+_FACT_ENUM_MAP: Optional[List[Tuple[str, str]]] = None  # list of (value_id, name)
 
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -61,9 +58,7 @@ async def get_deal_type_map() -> Dict[str, str]:
         _DEAL_TYPE_MAP = {i["STATUS_ID"]: i["NAME"] for i in items}
     return _DEAL_TYPE_MAP
 
-
 async def _enum_map_for_userfield(field_name: str) -> Dict[str, str]:
-    """Generic helper to fetch LIST options of a Deal UF enum."""
     fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
     uf = next((f for f in fields if f.get("FIELD_NAME") == field_name), None)
     options: Dict[str, str] = {}
@@ -72,13 +67,11 @@ async def _enum_map_for_userfield(field_name: str) -> Dict[str, str]:
             options[str(o["ID"])] = o["VALUE"]
     return options
 
-
 async def get_router_enum_map() -> Dict[str, str]:
     global _ROUTER_ENUM_MAP
     if _ROUTER_ENUM_MAP is None:
         _ROUTER_ENUM_MAP = await _enum_map_for_userfield("UF_CRM_1602756048")
     return _ROUTER_ENUM_MAP
-
 
 async def get_tariff_enum_map() -> Dict[str, str]:
     global _TARIFF_ENUM_MAP
@@ -86,6 +79,26 @@ async def get_tariff_enum_map() -> Dict[str, str]:
         _TARIFF_ENUM_MAP = await _enum_map_for_userfield("UF_CRM_1610558031277")
     return _TARIFF_ENUM_MAP
 
+async def get_fact_enum_list() -> List[Tuple[str, str]]:
+    """
+    For UF_CRM_1602766787968: returns list of (VALUE, NAME) excluding 'не выбрано'.
+    We'll keep order as returned by Bitrix (SORT asc).
+    """
+    global _FACT_ENUM_MAP
+    if _FACT_ENUM_MAP is None:
+        # fetch raw list to preserve order
+        fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
+        uf = next((f for f in fields if f.get("FIELD_NAME") == "UF_CRM_1602766787968"), None)
+        lst: List[Tuple[str, str]] = []
+        if uf and isinstance(uf.get("LIST"), list):
+            for o in uf["LIST"]:
+                val = str(o.get("VALUE", ""))
+                name = str(o.get("NAME", ""))
+                if val == "":  # skip 'не выбрано'
+                    continue
+                lst.append((val, name))
+        _FACT_ENUM_MAP = lst
+    return _FACT_ENUM_MAP
 
 # ----------------------------- UI helpers ---------------------------------
 
@@ -100,14 +113,12 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         selective=False,
     )
 
-
 def pick_brigade_inline_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=f"Бригада №{i}", callback_data=f"setbrig:{i}")]
         for i in (1, 2, 3, 4, 5)
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 # ----------------------------- Deal rendering ------------------------------
 
@@ -117,7 +128,6 @@ def _strip_bb(text: str) -> str:
     t = re.sub(r"\[/?p\]", "", text, flags=re.I)
     return t.strip()
 
-
 def _money_pair(val: Optional[str]) -> Optional[str]:
     if not val:
         return None
@@ -125,7 +135,6 @@ def _money_pair(val: Optional[str]) -> Optional[str]:
     if len(parts) == 2:
         return f"{parts[0]} {parts[1]}"
     return val
-
 
 async def render_deal_card(deal: Dict[str, Any]) -> str:
     deal_type_map = await get_deal_type_map()
@@ -192,89 +201,105 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
     ]
     return f"<b>{head}</b>\n\n" + "\n".join(body_lines)
 
-
 def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
     deal_id = str(deal.get("ID"))
     kb = [[InlineKeyboardButton(text="✅ Закрити угоду", callback_data=f"close:{deal_id}")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-
 async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
-    await bot.send_message(
-        chat_id,
-        text,
-        reply_markup=deal_keyboard(deal),
-        disable_web_page_preview=True,
-    )
-
+    await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal), disable_web_page_preview=True)
 
 # ----------------------------- Simple storage (brigade only) ---------------
 
 _USER_BRIGADE: Dict[int, int] = {}
 
-
 def get_user_brigade(user_id: int) -> Optional[int]:
     return _USER_BRIGADE.get(user_id)
-
 
 def set_user_brigade(user_id: int, brigade: int) -> None:
     _USER_BRIGADE[user_id] = brigade
 
-
-# ----------------------------- Close wizard with comment -------------------
-
-# Перелік “швидких причин” (кнопки). Ключ -> видимий текст.
-_QUICK_REASONS: Dict[str, str] = {
-    "done_ok": "Підключено та протестовано ✅",
-    "hw_installed": "Обладнання встановлено, все працює",
-    "client_moved": "Завдання виконано, клієнт задоволений",
-    "no_issues": "Без зауважень",
-    "other": "Ввести свій коментар…",
+# mapping "brigade number" -> UF_CRM_1611995532420[] option IDs (brigade items)
+_BRIGADE_EXEC_OPTION_ID = {
+    1: 5494,
+    2: 5496,
+    3: 5498,
+    4: 5500,
+    5: 5502,
 }
 
-# Очікування текстового коментаря: user_id -> {"deal_id": str}
-_PENDING_COMMENT: Dict[int, Dict[str, str]] = {}
+# ----------------------------- Close wizard (fact + reason) ----------------
 
+# user_id -> context
+_PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
 
-def _close_wizard_kb(deal_id: str) -> InlineKeyboardMarkup:
-    rows = []
-    # по 2 в рядок
-    pair = []
-    for key, label in _QUICK_REASONS.items():
-        pair.append(InlineKeyboardButton(text=label, callback_data=f"cmtsel:{deal_id}:{key}"))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
+_FACTS_PER_PAGE = 8
+
+def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
+    """
+    facts: list of (value_id, name)
+    """
+    start = page * _FACTS_PER_PAGE
+    chunk = facts[start:start + _FACTS_PER_PAGE]
+
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for val, name in chunk:
+        # each button selects a fact value
+        row.append(InlineKeyboardButton(text=name[:30], callback_data=f"factsel:{deal_id}:{val}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    nav: List[InlineKeyboardButton] = []
+    total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"Стор. {page+1}/{total_pages}", callback_data="noop"))
+    if (page + 1) * _FACTS_PER_PAGE < len(facts):
+        nav.append(InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"))
+    if nav:
+        rows.append(nav)
+
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
-async def _finalize_close_with_comment(user_id: int, deal_id: str, comment_text: str) -> None:
-    """Append comment to COMMENTS and close to WON."""
-    # 1) отримати угоду
+async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
+    # get deal and category
     deal = await b24("crm.deal.get", id=deal_id)
     if not deal:
         raise RuntimeError("Deal not found")
-
-    # 2) зібрати оновлений COMMENTS (акуратно додаємо новий блок)
-    prev_comments = _strip_bb(deal.get("COMMENTS") or "")
-    author = f"@user_{user_id}"  # можна замінити на username, якщо він є у Telegram
-    new_block = f"[p]<b>Коментар закриття</b>: {html.escape(comment_text)} (від {html.escape(author)})[/p]"
-
-    new_comments = new_block if not prev_comments else f"{prev_comments}\n\n{new_block}"
-
-    # 3) закрити угоду у WON + записати COMMENTS
     category = str(deal.get("CATEGORY_ID") or "0")
     target_stage = f"C{category}:WON"
-    await b24(
-        "crm.deal.update",
-        id=deal_id,
-        fields={"STAGE_ID": target_stage, "COMMENTS": new_comments},
-    )
 
+    # build COMMENTS append
+    prev_comments = _strip_bb(deal.get("COMMENTS") or "")
+    author = f"@user_{user_id}"
+    block = f"[p]<b>Закриття:</b> {html.escape(fact_name)}[/p]"
+    if reason_text:
+        block += f"\n[p]<b>Причина ремонту:</b> {html.escape(reason_text)}[/p]"
+    new_comments = block if not prev_comments else f"{prev_comments}\n\n{block}"
+
+    # executors: set brigade option by user brigade
+    brigade = get_user_brigade(user_id)
+    exec_list = []
+    if brigade and brigade in _BRIGADE_EXEC_OPTION_ID:
+        exec_list = [_BRIGADE_EXEC_OPTION_ID[brigade]]
+
+    # update fields
+    fields = {
+        "STAGE_ID": target_stage,
+        "COMMENTS": new_comments,
+        "UF_CRM_1602766787968": fact_val,            # Що по факту зробили (enum value id)
+        "UF_CRM_1702456465911": reason_text,         # Причина ремонту (free text)
+    }
+    if exec_list:
+        fields["UF_CRM_1611995532420"] = exec_list   # Виконавець (multi)
+
+    await b24("crm.deal.update", id=deal_id, fields=fields)
 
 # ----------------------------- Handlers ------------------------------------
 
@@ -291,11 +316,9 @@ async def cmd_start(m: Message):
     if not b:
         await m.answer("Швидкий вибір бригади:", reply_markup=pick_brigade_inline_kb())
 
-
 @dp.message(Command("menu"))
 async def cmd_menu(m: Message):
     await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
-
 
 @dp.message(Command("set_brigade"))
 async def cmd_set_brigade(m: Message):
@@ -317,8 +340,6 @@ async def cmd_set_brigade(m: Message):
     set_user_brigade(m.from_user.id, brigade)
     await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
 
-
-# Інлайн-вибір бригади
 @dp.callback_query(F.data.startswith("setbrig:"))
 async def cb_setbrig(c: CallbackQuery):
     await c.answer()
@@ -327,23 +348,18 @@ async def cb_setbrig(c: CallbackQuery):
     except Exception:
         await c.message.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
         return
-
     if brigade not in (1, 2, 3, 4, 5):
         await c.message.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
         return
-
     set_user_brigade(c.from_user.id, brigade)
     await c.message.answer(f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
 
-
-# Текстова кнопка «📦 Мої угоди»
 @dp.message(F.text == "📦 Мої угоди")
 async def msg_my_deals(m: Message):
     brigade = get_user_brigade(m.from_user.id)
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
-
     stage_code = {
         1: "UC_XF8O6V",
         2: "UC_0XLPCN",
@@ -351,7 +367,6 @@ async def msg_my_deals(m: Message):
         4: "UC_TNEW3Z",
         5: "UC_RMBZ37",
     }.get(brigade)
-
     if not stage_code:
         await m.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
         return
@@ -371,26 +386,20 @@ async def msg_my_deals(m: Message):
             "UF_CRM_1609868447208",
         ],
     )
-
     if not deals:
         await m.answer("Немає активних угод.", reply_markup=main_menu_kb())
         return
-
     for d in deals[:25]:
         await send_deal_card(m.chat.id, d)
 
-
-# Сумісність зі старою інлайн-кнопкою (якщо десь залишиться)
 @dp.callback_query(F.data == "my_deals")
 async def cb_my_deals(c: CallbackQuery):
     await c.answer()
     await msg_my_deals(c.message)
 
-
 @dp.message(F.text == "📋 Мої задачі")
 async def msg_tasks(m: Message):
     await m.answer("Задачі ще в розробці 🛠️", reply_markup=main_menu_kb())
-
 
 @dp.message(Command("deal_dump"))
 async def deal_dump(m: Message):
@@ -404,90 +413,114 @@ async def deal_dump(m: Message):
     if not deal:
         await m.answer("Не знайшов угоду.", reply_markup=main_menu_kb())
         return
-
     pretty = html.escape(json.dumps(deal, ensure_ascii=False, indent=2))
     await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>", reply_markup=main_menu_kb())
     await send_deal_card(m.chat.id, deal)
 
-
-# ======== МАЙСТЕР ЗАКРИТТЯ З КОМЕНТАРЕМ ========
+# ======== МАЙСТЕР ЗАКРИТТЯ: вибір факту + причина ==========
 
 @dp.callback_query(F.data.startswith("close:"))
 async def cb_close_deal_start(c: CallbackQuery):
-    """Початок майстра: показати варіанти коментарів/ввід свого."""
     await c.answer()
     deal_id = c.data.split(":", 1)[1]
-    _PENDING_COMMENT[c.from_user.id] = {"deal_id": deal_id}
+    facts = await get_fact_enum_list()
+    _PENDING_CLOSE[c.from_user.id] = {"deal_id": deal_id, "stage": "pick_fact", "page": 0}
     await c.message.answer(
-        f"Закриваємо угоду #{deal_id}. Оберіть коментар або введіть свій текст повідомлення одним наступним повідомленням:",
-        reply_markup=_close_wizard_kb(deal_id),
+        f"Закриваємо угоду #{deal_id}. Оберіть, що зроблено:",
+        reply_markup=_facts_page_kb(deal_id, 0, facts),
     )
 
-
-@dp.callback_query(F.data.startswith("cmtsel:"))
-async def cb_close_deal_quick(c: CallbackQuery):
-    """Клік по готовому варіанту (включно з «Ввести свій коментар…»)."""
+@dp.callback_query(F.data.startswith("factpage:"))
+async def cb_fact_page(c: CallbackQuery):
     await c.answer()
     parts = c.data.split(":")
-    # cmtsel:{deal_id}:{key}
     if len(parts) < 3:
         return
-    deal_id, key = parts[1], parts[2]
-
-    if key == "other":
-        # просимо ввести текст
-        _PENDING_COMMENT[c.from_user.id] = {"deal_id": deal_id}
-        await c.message.answer("Введіть ваш коментар одним повідомленням ⌨️")
-        return
-
-    # беремо текст з пресетів і закриваємо
-    text = _QUICK_REASONS.get(key, "").strip()
-    if not text:
-        await c.message.answer("Не вдалося прочитати коментар.")
-        return
-
+    deal_id, page_s = parts[1], parts[2]
     try:
-        await _finalize_close_with_comment(c.from_user.id, deal_id, text)
-        await c.message.answer(f"✅ Угоду #{deal_id} закрито. Коментар додано.")
+        page = int(page_s)
+    except:
+        page = 0
+    facts = await get_fact_enum_list()
+    await c.message.edit_reply_markup(reply_markup=_facts_page_kb(deal_id, page, facts))
+    ctx = _PENDING_CLOSE.get(c.from_user.id)
+    if ctx:
+        ctx["page"] = page
+
+@dp.callback_query(F.data.startswith("factsel:"))
+async def cb_fact_select(c: CallbackQuery):
+    await c.answer()
+    parts = c.data.split(":")
+    if len(parts) < 3:
+        return
+    deal_id, fact_val = parts[1], parts[2]
+    facts = await get_fact_enum_list()
+    fact_name = next((n for v, n in facts if v == fact_val), "")
+    if not fact_name:
+        await c.message.answer("Не вдалося обрати значення.")
+        return
+    _PENDING_CLOSE[c.from_user.id] = {
+        "deal_id": deal_id,
+        "stage": "await_reason",
+        "fact_val": fact_val,
+        "fact_name": fact_name,
+    }
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пропустити", callback_data=f"reason_skip:{deal_id}")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")],
+    ])
+    await c.message.answer(
+        f"Обрано: <b>{html.escape(fact_name)}</b>\nВведіть причину ремонту одним повідомленням, або натисніть «Пропустити».",
+        reply_markup=kb,
+    )
+
+@dp.callback_query(F.data.startswith("reason_skip:"))
+async def cb_reason_skip(c: CallbackQuery):
+    await c.answer()
+    ctx = _PENDING_CLOSE.get(c.from_user.id)
+    if not ctx or ctx.get("stage") != "await_reason":
+        await c.message.answer("Нема активного закриття.")
+        return
+    deal_id = ctx["deal_id"]
+    fact_val = ctx["fact_val"]
+    fact_name = ctx["fact_name"]
+    try:
+        await _finalize_close(c.from_user.id, deal_id, fact_val, fact_name, reason_text="")
+        await c.message.answer(f"✅ Угоду #{deal_id} закрито. Дані записані.")
         deal2 = await b24("crm.deal.get", id=deal_id)
         await send_deal_card(c.message.chat.id, deal2)
     except Exception as e:
-        log.exception("close with quick comment failed")
+        log.exception("finalize close (skip reason) failed")
         await c.message.answer(f"❗️Помилка закриття: {e}")
     finally:
-        _PENDING_COMMENT.pop(c.from_user.id, None)
-
+        _PENDING_CLOSE.pop(c.from_user.id, None)
 
 @dp.callback_query(F.data.startswith("cmtcancel:"))
-async def cb_close_deal_cancel(c: CallbackQuery):
+async def cb_close_cancel(c: CallbackQuery):
     await c.answer("Скасовано")
-    _PENDING_COMMENT.pop(c.from_user.id, None)
+    _PENDING_CLOSE.pop(c.from_user.id, None)
     await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
 
-
-# Текст наступним повідомленням — це власний коментар користувача
+# Текст причини ремонту
 @dp.message()
 async def catch_free_text(m: Message):
-    ctx = _PENDING_COMMENT.get(m.from_user.id)
-    if not ctx:
-        return  # це не коментар до закриття — інші хендлери вже спрацювали вище
-    deal_id = ctx.get("deal_id")
-    text = (m.text or "").strip()
-    if not text:
-        await m.answer("Порожній коментар. Введіть текст або натисніть «❌ Скасувати».")
+    ctx = _PENDING_CLOSE.get(m.from_user.id)
+    if not ctx or ctx.get("stage") != "await_reason":
         return
-
+    deal_id = ctx["deal_id"]
+    fact_val = ctx["fact_val"]
+    fact_name = ctx["fact_name"]
+    reason = (m.text or "").strip()
     try:
-        await _finalize_close_with_comment(m.from_user.id, deal_id, text)
-        await m.answer(f"✅ Угоду #{deal_id} закрито. Коментар додано.")
+        await _finalize_close(m.from_user.id, deal_id, fact_val, fact_name, reason_text=reason)
+        await m.answer(f"✅ Угоду #{deal_id} закрито. Дані записані.")
         deal2 = await b24("crm.deal.get", id=deal_id)
         await send_deal_card(m.chat.id, deal2)
     except Exception as e:
-        log.exception("close with custom comment failed")
+        log.exception("finalize close (reason text) failed")
         await m.answer(f"❗️Помилка закриття: {e}")
     finally:
-        _PENDING_COMMENT.pop(m.from_user.id, None)
-
+        _PENDING_CLOSE.pop(m.from_user.id, None)
 
 # ----------------------------- Webhook plumbing ----------------------------
 
@@ -496,7 +529,6 @@ async def on_startup():
     global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
-    # Команди бота
     await bot.set_my_commands([
         BotCommand(command="start", description="Почати"),
         BotCommand(command="menu", description="Показати меню"),
@@ -508,13 +540,11 @@ async def on_startup():
     log.info("[startup] setting webhook to: %s", url)
     await bot.set_webhook(url)
 
-
 @app.on_event("shutdown")
 async def on_shutdown():
     await bot.delete_webhook()
     await HTTP.close()
     await bot.session.close()
-
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
