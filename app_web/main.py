@@ -104,7 +104,10 @@ async def get_tariff_enum_map() -> Dict[str, str]:
     return _TARIFF_ENUM_MAP
 
 async def get_fact_enum_list() -> List[Tuple[str, str]]:
-    """UF_CRM_1602766787968: list of (VALUE, NAME), excluding empty default."""
+    """
+    UF_CRM_1602766787968: повертає список (option_id, option_name).
+    option_id = LIST[].ID, option_name = LIST[].VALUE
+    """
     global _FACT_ENUM_LIST
     if _FACT_ENUM_LIST is None:
         fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
@@ -112,14 +115,15 @@ async def get_fact_enum_list() -> List[Tuple[str, str]]:
         lst: List[Tuple[str, str]] = []
         if uf and isinstance(uf.get("LIST"), list):
             for o in uf["LIST"]:
-                val = str(o.get("VALUE", ""))     # VALUE — це те, що треба записувати в угоду
-                name = str(o.get("NAME", ""))
-                if val == "":
+                opt_id = str(o.get("ID") or "")
+                opt_name = str(o.get("VALUE") or "")
+                if not opt_id:
                     continue
-                lst.append((val, name))
+                lst.append((opt_id, opt_name))
         _FACT_ENUM_LIST = lst
         log.info("[cache] FACT enum loaded: %s options", len(_FACT_ENUM_LIST))
     return _FACT_ENUM_LIST
+
 
 # ----------------------------- UI helpers ----------------------------------
 def main_menu_kb() -> ReplyKeyboardMarkup:
