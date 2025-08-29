@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,18 +41,26 @@ B24_BASE = settings.BITRIX_WEBHOOK_BASE.rstrip("/")
 HTTP: aiohttp.ClientSession
 
 async def b24(method: str, **params) -> Any:
-    """Single call to Bitrix REST method."""
+    """Bitrix REST call with retry on rate limits."""
     url = f"{B24_BASE}/{method}.json"
-    async with HTTP.post(url, json=params) as resp:
-        data = await resp.json()
-        if "error" in data:
-            raise RuntimeError(f"B24 error: {data['error']}: {data.get('error_description')}")
-        return data.get("result")
+    retries = 5
+    backoff = 0.4
+    for attempt in range(retries):
+        async with HTTP.post(url, json=params) as resp:
+            data = await resp.json()
+        if "error" not in data:
+            return data.get("result")
+        err = data.get("error", "")
+        desc = data.get("error_description")
+        if err == "QUERY_LIMIT_EXCEEDED" and attempt < retries - 1:
+            sleep_for = backoff * (2 ** attempt)
+            log.warning("[b24] rate limited, retry in %.2fs (attempt %s/%s)", sleep_for, attempt + 1, retries)
+            await asyncio.sleep(sleep_for)
+            continue
+        raise RuntimeError(f"B24 error: {err}: {desc}")
 
 async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.2, **params) -> List[Dict[str, Any]]:
-    """
-    Paginates Bitrix listings (crm.deal.list etc.)
-    """
+    """Paginated Bitrix listings (crm.deal.list etc.)."""
     start = 0
     items: List[Dict[str, Any]] = []
     while True:
@@ -60,10 +69,9 @@ async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.2, 
         res = await b24(method, **payload)
         chunk = res or []
         if isinstance(chunk, dict) and "items" in chunk:
-            # some endpoints return {"items":[...], "next":..}
             chunk = chunk.get("items", [])
         items.extend(chunk)
-        log.info("[b24_list] %s got %s items (total so far %s) start=%s", method, len(chunk), len(items), start)
+        log.info("[b24_list] %s got %s items (total %s) start=%s", method, len(chunk), len(items), start)
         if len(chunk) < page_size:
             break
         start += page_size
@@ -107,9 +115,7 @@ async def get_tariff_enum_map() -> Dict[str, str]:
     return _TARIFF_ENUM_MAP
 
 async def get_fact_enum_list() -> List[Tuple[str, str]]:
-    """
-    UF_CRM_1602766787968: list of (VALUE, NAME), excluding empty default.
-    """
+    """UF_CRM_1602766787968: list of (VALUE, NAME), excluding empty default."""
     global _FACT_ENUM_LIST
     if _FACT_ENUM_LIST is None:
         fields = await b24("crm.deal.userfield.list", order={"SORT": "ASC"})
@@ -117,7 +123,7 @@ async def get_fact_enum_list() -> List[Tuple[str, str]]:
         lst: List[Tuple[str, str]] = []
         if uf and isinstance(uf.get("LIST"), list):
             for o in uf["LIST"]:
-                val = str(o.get("VALUE", ""))
+                val = str(o.get("VALUE", ""))  # VALUE = ID у Bitrix для enum-поля
                 name = str(o.get("NAME", ""))
                 if val == "":
                     continue
@@ -246,42 +252,42 @@ def set_user_brigade(user_id: int, brigade: int) -> None:
     _USER_BRIGADE[user_id] = brigade
 
 # mapping "brigade number" -> UF_CRM_1611995532420[] option IDs (brigade items)
-_BRIGADE_EXEC_OPTION_ID = {
-    1: 5494,
-    2: 5496,
-    3: 5498,
-    4: 5500,
-    5: 5502,
-}
+_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
 
 # mapping brigade -> stage code in pipeline C20
-_BRIGADE_STAGE = {
-    1: "UC_XF8O6V",
-    2: "UC_0XLPCN",
-    3: "UC_204CP3",
-    4: "UC_TNEW3Z",
-    5: "UC_RMBZ37",
-}
+_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
 
 # ----------------------------- Close wizard (fact + reason) ----------------
 _PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
-_FACTS_PER_PAGE = 0  # 0 => усі в один стовпчик
+_FACTS_PER_PAGE = 8  # показуємо сторінками, 1 опція в рядок
 
 def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    # В один стовпчик — кожна опція окремим рядом
-    for val, name in facts:
+    total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * _FACTS_PER_PAGE
+    chunk = facts[start:start + _FACTS_PER_PAGE]
+
+    # 1 опція = 1 рядок
+    for val, name in chunk:
         rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
-    # Навігацію залишимо як було (для майбутнього, якщо знову треба сторінки)
-    rows.append([
-        InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{max(page-1,0)}"),
-        InlineKeyboardButton(text=f"Стор. {page+1}/1", callback_data="noop"),
-        InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"),
-    ])
+
+    # Навігація тільки якщо сторінок > 1
+    if total_pages > 1:
+        nav: List[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"Стор. {page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"))
+        rows.append(nav)
+
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
+    log.info("[close] finalize deal=%s fact=%s", deal_id, fact_val)
     deal = await b24("crm.deal.get", id=deal_id)
     if not deal:
         raise RuntimeError("Deal not found")
@@ -312,14 +318,9 @@ async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: 
 
 # ----------------------------- Report helpers ------------------------------
 def _tz_ua_now() -> datetime:
-    # якщо потрібно інший TZ — зміни тут
     return datetime.now(timezone.utc)
 
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
-    """
-    Повертає (date_label, from_iso, to_iso) для доби offset_days (0 — сьогодні, 1 — вчора)
-    ISO з часовою зоною UTC, Bitrix це сприймає коректно.
-    """
     now = _tz_ua_now()
     start = (now + timedelta(days=-offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
@@ -327,12 +328,7 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
     return label, start.isoformat(), end.isoformat()
 
 def normalize_type(type_name: str) -> str:
-    """
-    Зводимо назву типу угоди до наших категорій:
-    'connection' | 'repair' | 'service' | 'accident' | 'other'
-    """
     t = (type_name or "").strip().lower()
-    # типові ваші назви:
     if "підключ" in t or "подключ" in t:
         return "connection"
     if "ремонт" in t:
@@ -341,22 +337,15 @@ def normalize_type(type_name: str) -> str:
         return "service"
     if "авар" in t:
         return "accident"
-    # запасний варіант
     return "other"
 
 async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], int]:
-    """
-    Повертає (date_label, counts_by_type, active_left)
-    counts_by_type: dict keys = connection/repair/service/accident/other
-    """
     if brigade not in _BRIGADE_STAGE:
         raise RuntimeError("Unknown brigade")
 
     label, frm, to = _day_bounds(offset_days)
     deal_type_map = await get_deal_type_map()
 
-    # 1) Закриті за добу (WON), виконувала конкретна бригада
-    #    Фільтр по multi UF: рівність значенню довідника працює.
     exec_opt = _BRIGADE_EXEC_OPTION_ID.get(brigade)
     filter_closed = {
         "STAGE_ID": "C20:WON",
@@ -384,7 +373,6 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
         cls = normalize_type(tname)
         counts[cls] = counts.get(cls, 0) + 1
 
-    # 2) Активні в колонці бригади
     stage_code = _BRIGADE_STAGE[brigade]
     filter_active = {"CLOSED": "N", "STAGE_ID": f"C20:{stage_code}"}
     log.info("[report] active filter: %s", filter_active)
@@ -416,6 +404,23 @@ def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_
         f"<b>Активних задач на бригаді залишилось:</b> {active_left}",
     ]
     return "\n".join(lines)
+
+# ----------------------------- Text normalizer for report buttons ----------
+def _norm(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = re.sub(r"[^\w\s\u0400-\u04FF]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+def _is_today_report(txt: str) -> bool:
+    t = _norm(txt)
+    return "звіт за сьогодні" in t or "звіт сьогодні" in t
+
+def _is_yesterday_report(txt: str) -> bool:
+    t = _norm(txt)
+    return "звіт за вчора" in t or "звіт вчора" in t
 
 # ----------------------------- Handlers ------------------------------------
 @dp.message(Command("start"))
@@ -515,6 +520,7 @@ async def cb_close_deal_start(c: CallbackQuery):
     deal_id = c.data.split(":", 1)[1]
     facts = await get_fact_enum_list()
     _PENDING_CLOSE[c.from_user.id] = {"deal_id": deal_id, "stage": "pick_fact", "page": 0}
+    log.info("[close] start for deal=%s, facts=%s", deal_id, len(facts))
     await c.message.answer(
         f"Закриваємо угоду <a href=\"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/\">#{deal_id}</a>. Оберіть, що зроблено:",
         reply_markup=_facts_page_kb(deal_id, 0, facts),
@@ -613,31 +619,37 @@ async def catch_free_text(m: Message):
         _PENDING_CLOSE.pop(m.from_user.id, None)
 
 # ----------------------------- Reports -------------------------------------
-@dp.message(F.text == "📊 Звіт за сьогодні")
-async def msg_report_today(m: Message):
+async def _handle_report(m: Message, when: str):
+    log.info("[report] _handle_report start: user=%s, when=%s", m.from_user.id, when)
     brigade = get_user_brigade(m.from_user.id)
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
     try:
-        label, counts, active_left = await build_daily_report(brigade, offset_days=0)
+        offset = 0 if when == "today" else 1
+        label, counts, active_left = await build_daily_report(brigade, offset_days=offset)
         await m.answer(format_report(brigade, label, counts, active_left), reply_markup=main_menu_kb())
     except Exception as e:
-        log.exception("report today failed")
+        log.exception("report %s failed", when)
         await m.answer(f"❗️Помилка формування звіту: {e}")
 
-@dp.message(F.text == "📉 Звіт за вчора")
-async def msg_report_yesterday(m: Message):
-    brigade = get_user_brigade(m.from_user.id)
-    if not brigade:
-        await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
-        return
-    try:
-        label, counts, active_left = await build_daily_report(brigade, offset_days=1)
-        await m.answer(format_report(brigade, label, counts, active_left), reply_markup=main_menu_kb())
-    except Exception as e:
-        log.exception("report yesterday failed")
-        await m.answer(f"❗️Помилка формування звіту: {e}")
+# стабільні текстові хендлери
+@dp.message(F.text.func(lambda s: _is_today_report(s)))
+async def msg_report_today_text(m: Message):
+    await _handle_report(m, when="today")
+
+@dp.message(F.text.func(lambda s: _is_yesterday_report(s)))
+async def msg_report_yesterday_text(m: Message):
+    await _handle_report(m, when="yesterday")
+
+# також команди-аліаси
+@dp.message(Command("report_today"))
+async def cmd_report_today(m: Message):
+    await _handle_report(m, when="today")
+
+@dp.message(Command("report_yesterday"))
+async def cmd_report_yesterday(m: Message):
+    await _handle_report(m, when="yesterday")
 
 # ----------------------------- Dev helpers ---------------------------------
 @dp.message(Command("deal_dump"))
@@ -667,6 +679,8 @@ async def on_startup():
         BotCommand(command="menu", description="Показати меню"),
         BotCommand(command="set_brigade", description="Вибрати бригаду"),
         BotCommand(command="deal_dump", description="Показати dump угоди"),
+        BotCommand(command="report_today", description="Звіт за сьогодні"),
+        BotCommand(command="report_yesterday", description="Звіт за вчора"),
     ])
 
     url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
