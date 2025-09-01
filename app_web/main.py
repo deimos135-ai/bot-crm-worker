@@ -23,7 +23,11 @@ from aiogram.types import (
     Update,
     CallbackQuery,
 )
-from aiogram.exceptions import TelegramNetworkError, TelegramBadRequest
+
+# === NEW: shorter TG timeouts session
+from aiogram.client.session.aiohttp import AiohttpSession
+import aiohttp as aiohttp_lib
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramBadRequest
 
 from shared.settings import settings
 
@@ -33,7 +37,15 @@ log = logging.getLogger("app")
 
 # ----------------------------- App / Bot -----------------------------------
 app = FastAPI()
-bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+# Telegram HTTP session with short timeouts (prevents 60s hangs)
+tg_http_timeout = aiohttp_lib.ClientTimeout(total=12, sock_connect=8, sock_read=8)
+tg_session = AiohttpSession(timeout=tg_http_timeout)
+bot = Bot(
+    token=settings.BOT_TOKEN,
+    session=tg_session,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 
 # ----------------------------- Bitrix helpers ------------------------------
@@ -69,11 +81,41 @@ async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.2, 
             await asyncio.sleep(throttle)
     return items
 
+# ----------------------------- TG safe send helpers ------------------------
+async def _retry_backoff(attempt: int) -> float:
+    # 1 -> 0.5s, 2 -> 1s, 3 -> 2s, 4 -> 4s (cap 5s)
+    return min(0.5 * (2 ** (attempt - 1)), 5.0)
+
+async def send_safe_message(chat_id: int, text: str, **kwargs):
+    attempts = 0
+    while True:
+        try:
+            return await bot.send_message(chat_id, text, **kwargs)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except TelegramNetworkError:
+            attempts += 1
+            if attempts > 4:
+                raise
+            await asyncio.sleep(await _retry_backoff(attempts))
+        except TelegramBadRequest as e:
+            # e.g. "message is too long" — trim & retry once more
+            if len(text) > 4000:
+                text = text[:3990] + "…"
+                continue
+            raise
+
+async def safe_callback_answer(c: CallbackQuery, text: str = "", show_alert: bool = False):
+    try:
+        await c.answer(text=text, show_alert=show_alert, cache_time=0)
+    except Exception:
+        pass
+
 # ----------------------------- Caches --------------------------------------
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
 _ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1602756048
 _TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1610558031277
-_FACT_ENUM_LIST: Optional[List[Tuple[str, str]]] = None  # (option_id, option_name)
+_FACT_ENUM_LIST: Optional[List[Tuple[str, str]]] = None  # (VALUE, NAME)
 
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -199,7 +241,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         except Exception as e:
             log.warning("contact.get failed: %s", e)
 
-    # Показуємо “Що зроблено” + “Причина ремонту”
+    # Show "What done" + "Repair reason"
     fact_val = str(deal.get("UF_CRM_1602766787968") or "")
     fact_name = "—"
     if fact_val:
@@ -245,18 +287,9 @@ def deal_keyboard(deal: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
-    await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal), disable_web_page_preview=True)
+    await send_safe_message(chat_id, text, reply_markup=deal_keyboard(deal), disable_web_page_preview=True)
 
-# ---------------------- Safe callback answer helper ------------------------
-async def safe_callback_answer(c: CallbackQuery, text: Optional[str] = None) -> None:
-    try:
-        await c.answer(text=text, cache_time=1)
-    except (TelegramNetworkError, TelegramBadRequest) as e:
-        log.warning("callback answer failed: %s", e)
-    except Exception as e:
-        log.exception("callback answer unexpected error: %s", e)
-
-# ----------------------------- Simple storage ------------------------------
+# ----------------------------- Simple storage (brigade only) ---------------
 _USER_BRIGADE: Dict[int, int] = {}
 
 def get_user_brigade(user_id: int) -> Optional[int]:
@@ -273,7 +306,7 @@ _BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z"
 
 # ----------------------------- Close wizard --------------------------------
 _PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
-_FACTS_PER_PAGE = 8  # 1 опція = 1 рядок
+_FACTS_PER_PAGE = 8  # one option per row
 
 def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
@@ -319,7 +352,7 @@ async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: 
     fields = {
         "STAGE_ID": target_stage,
         "COMMENTS": new_comments,
-        "UF_CRM_1602766787968": fact_val,     # Що по факту зробили (enum option id)
+        "UF_CRM_1602766787968": fact_val,     # Що по факту зробили (enum VALUE)
         "UF_CRM_1702456465911": reason_text,  # Причина ремонту (free text)
     }
     if exec_list:
@@ -421,31 +454,31 @@ async def cmd_start(m: Message):
         text += f"\nПоточна бригада: №{b}"
     else:
         text += "\nОберіть вашу бригаду нижче ⬇️"
-    await m.answer(text, reply_markup=main_menu_kb())
+    await send_safe_message(m.chat.id, text, reply_markup=main_menu_kb())
     if not b:
-        await m.answer("Швидкий вибір бригади:", reply_markup=pick_brigade_inline_kb())
+        await send_safe_message(m.chat.id, "Швидкий вибір бригади:", reply_markup=pick_brigade_inline_kb())
 
 @dp.message(Command("menu"))
 async def cmd_menu(m: Message):
-    await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
+    await send_safe_message(m.chat.id, "Меню відкрито 👇", reply_markup=main_menu_kb())
 
 @dp.message(Command("set_brigade"))
 async def cmd_set_brigade(m: Message):
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await m.answer("Вкажіть номер бригади: /set_brigade 1", reply_markup=main_menu_kb())
-        await m.answer("Або натисніть кнопку:", reply_markup=pick_brigade_inline_kb())
+        await send_safe_message(m.chat.id, "Вкажіть номер бригади: /set_brigade 1", reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, "Або натисніть кнопку:", reply_markup=pick_brigade_inline_kb())
         return
     try:
         brigade = int(parts[1])
     except ValueError:
-        await m.answer("Номер має бути числом: 1..5", reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, "Номер має бути числом: 1..5", reply_markup=main_menu_kb())
         return
     if brigade not in (1, 2, 3, 4, 5):
-        await m.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, "Доступні бригади: 1..5", reply_markup=main_menu_kb())
         return
     set_user_brigade(m.from_user.id, brigade)
-    await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
+    await send_safe_message(m.chat.id, f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data.startswith("setbrig:"))
 async def cb_setbrig(c: CallbackQuery):
@@ -453,26 +486,26 @@ async def cb_setbrig(c: CallbackQuery):
     try:
         brigade = int(c.data.split(":", 1)[1])
     except Exception:
-        await c.message.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
+        await send_safe_message(c.message.chat.id, "Невірний номер бригади.", reply_markup=main_menu_kb())
         return
     if brigade not in (1, 2, 3, 4, 5):
-        await c.message.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
+        await send_safe_message(c.message.chat.id, "Доступні бригади: 1..5", reply_markup=main_menu_kb())
         return
     set_user_brigade(c.from_user.id, brigade)
-    await c.message.answer(f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
+    await send_safe_message(c.message.chat.id, f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
 
 @dp.message(F.text == "📦 Мої угоди")
 async def msg_my_deals(m: Message):
     brigade = get_user_brigade(m.from_user.id)
     if not brigade:
-        await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
+        await send_safe_message(m.chat.id, "Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
     stage_code = _BRIGADE_STAGE.get(brigade)
     if not stage_code:
-        await m.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, "Невірний номер бригади.", reply_markup=main_menu_kb())
         return
 
-    await m.answer(f"📦 Завантажую угоди для бригади №{brigade}…", reply_markup=main_menu_kb())
+    await send_safe_message(m.chat.id, f"📦 Завантажую угоди для бригади №{brigade}…", reply_markup=main_menu_kb())
 
     deals: List[Dict[str, Any]] = await b24_list(
         "crm.deal.list",
@@ -491,7 +524,7 @@ async def msg_my_deals(m: Message):
         page_size=100,
     )
     if not deals:
-        await m.answer("Немає активних угод.", reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, "Немає активних угод.", reply_markup=main_menu_kb())
         return
     for d in deals[:25]:
         await send_deal_card(m.chat.id, d)
@@ -503,7 +536,7 @@ async def cb_my_deals(c: CallbackQuery):
 
 @dp.message(F.text == "📋 Мої задачі")
 async def msg_tasks(m: Message):
-    await m.answer("Задачі ще в розробці 🛠️", reply_markup=main_menu_kb())
+    await send_safe_message(m.chat.id, "Задачі ще в розробці 🛠️", reply_markup=main_menu_kb())
 
 # --------- Закриття угоди: «що зроблено» + причина ------------------------
 @dp.callback_query(F.data.startswith("close:"))
@@ -512,7 +545,8 @@ async def cb_close_deal_start(c: CallbackQuery):
     deal_id = c.data.split(":", 1)[1]
     facts = await get_fact_enum_list()
     _PENDING_CLOSE[c.from_user.id] = {"deal_id": deal_id, "stage": "pick_fact", "page": 0}
-    await c.message.answer(
+    await send_safe_message(
+        c.message.chat.id,
         f"Закриваємо угоду <a href=\"https://{settings.B24_DOMAIN}/crm/deal/details/{deal_id}/\">#{deal_id}</a>. Оберіть, що зроблено:",
         reply_markup=_facts_page_kb(deal_id, 0, facts),
         disable_web_page_preview=True,
@@ -530,7 +564,15 @@ async def cb_fact_page(c: CallbackQuery):
     except:
         page = 0
     facts = await get_fact_enum_list()
-    await c.message.edit_reply_markup(reply_markup=_facts_page_kb(deal_id, page, facts))
+    try:
+        await c.message.edit_reply_markup(reply_markup=_facts_page_kb(deal_id, page, facts))
+    except Exception:
+        # якщо TG не дає редагувати (старе повідомлення), просто надішлемо нове
+        await send_safe_message(
+            c.message.chat.id,
+            "Оновив список варіантів:",
+            reply_markup=_facts_page_kb(deal_id, page, facts),
+        )
     ctx = _PENDING_CLOSE.get(c.from_user.id)
     if ctx:
         ctx["page"] = page
@@ -545,7 +587,7 @@ async def cb_fact_select(c: CallbackQuery):
     facts = await get_fact_enum_list()
     fact_name = next((n for v, n in facts if v == fact_val), "")
     if not fact_name:
-        await c.message.answer("Не вдалося обрати значення.")
+        await send_safe_message(c.message.chat.id, "Не вдалося обрати значення.")
         return
     _PENDING_CLOSE[c.from_user.id] = {
         "deal_id": deal_id,
@@ -557,7 +599,8 @@ async def cb_fact_select(c: CallbackQuery):
         [InlineKeyboardButton(text="Пропустити", callback_data=f"reason_skip:{deal_id}")],
         [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")],
     ])
-    await c.message.answer(
+    await send_safe_message(
+        c.message.chat.id,
         f"Обрано: <b>{html.escape(fact_name)}</b>\nВведіть причину ремонту одним повідомленням, або натисніть «Пропустити».",
         reply_markup=kb,
     )
@@ -567,19 +610,19 @@ async def cb_reason_skip(c: CallbackQuery):
     await safe_callback_answer(c)
     ctx = _PENDING_CLOSE.get(c.from_user.id)
     if not ctx or ctx.get("stage") != "await_reason":
-        await c.message.answer("Нема активного закриття.")
+        await send_safe_message(c.message.chat.id, "Нема активного закриття.")
         return
     deal_id = ctx["deal_id"]
     fact_val = ctx["fact_val"]
     fact_name = ctx["fact_name"]
     try:
         await _finalize_close(c.from_user.id, deal_id, fact_val, fact_name, reason_text="")
-        await c.message.answer(f"✅ Угоду #{deal_id} закрито. Дані записані.")
+        await send_safe_message(c.message.chat.id, f"✅ Угоду #{deal_id} закрито. Дані записані.")
         deal2 = await b24("crm.deal.get", id=deal_id)
         await send_deal_card(c.message.chat.id, deal2)
     except Exception as e:
         log.exception("finalize close (skip reason) failed")
-        await c.message.answer(f"❗️Помилка закриття: {e}")
+        await send_safe_message(c.message.chat.id, f"❗️Помилка закриття: {e}")
     finally:
         _PENDING_CLOSE.pop(c.from_user.id, None)
 
@@ -587,7 +630,7 @@ async def cb_reason_skip(c: CallbackQuery):
 async def cb_close_cancel(c: CallbackQuery):
     await safe_callback_answer(c, text="Скасовано")
     _PENDING_CLOSE.pop(c.from_user.id, None)
-    await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
+    await send_safe_message(c.message.chat.id, "Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
 
 # ---------- приймаємо ТІЛЬКИ коли чекаємо текст причини -------------------
 @dp.message(lambda m: _PENDING_CLOSE.get(m.from_user.id, {}).get("stage") == "await_reason")
@@ -599,12 +642,12 @@ async def catch_reason_text(m: Message):
     reason = (m.text or "").strip()
     try:
         await _finalize_close(m.from_user.id, deal_id, fact_val, fact_name, reason_text=reason)
-        await m.answer(f"✅ Угоду #{deal_id} закрито. Дані записані.")
+        await send_safe_message(m.chat.id, f"✅ Угоду #{deal_id} закрито. Дані записані.")
         deal2 = await b24("crm.deal.get", id=deal_id)
         await send_deal_card(m.chat.id, deal2)
     except Exception as e:
         log.exception("finalize close (reason text) failed")
-        await m.answer(f"❗️Помилка закриття: {e}")
+        await send_safe_message(m.chat.id, f"❗️Помилка закриття: {e}")
     finally:
         _PENDING_CLOSE.pop(m.from_user.id, None)
 
@@ -613,27 +656,27 @@ async def catch_reason_text(m: Message):
 async def msg_report_today(m: Message):
     brigade = get_user_brigade(m.from_user.id)
     if not brigade:
-        await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
+        await send_safe_message(m.chat.id, "Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
     try:
         label, counts, active_left = await build_daily_report(brigade, offset_days=0)
-        await m.answer(format_report(brigade, label, counts, active_left), reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, format_report(brigade, label, counts, active_left), reply_markup=main_menu_kb())
     except Exception as e:
         log.exception("report today failed")
-        await m.answer(f"❗️Помилка формування звіту: {e}")
+        await send_safe_message(m.chat.id, f"❗️Помилка формування звіту: {e}")
 
 @dp.message(F.text == "📉 Звіт за вчора")
 async def msg_report_yesterday(m: Message):
     brigade = get_user_brigade(m.from_user.id)
     if not brigade:
-        await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
+        await send_safe_message(m.chat.id, "Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
     try:
         label, counts, active_left = await build_daily_report(brigade, offset_days=1)
-        await m.answer(format_report(brigade, label, counts, active_left), reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, format_report(brigade, label, counts, active_left), reply_markup=main_menu_kb())
     except Exception as e:
         log.exception("report yesterday failed")
-        await m.answer(f"❗️Помилка формування звіту: {e}")
+        await send_safe_message(m.chat.id, f"❗️Помилка формування звіту: {e}")
 
 # ----------------------------- Dev helpers ---------------------------------
 @dp.message(Command("deal_dump"))
@@ -641,15 +684,15 @@ async def deal_dump(m: Message):
     mtext = (m.text or "").strip()
     m2 = re.search(r"(\d+)", mtext)
     if not m2:
-        await m.answer("Вкажіть ID угоди: /deal_dump 12345", reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, "Вкажіть ID угоди: /deal_dump 12345", reply_markup=main_menu_kb())
         return
     deal_id = m2.group(1)
     deal = await b24("crm.deal.get", id=deal_id)
     if not deal:
-        await m.answer("Не знайшов угоду.", reply_markup=main_menu_kb())
+        await send_safe_message(m.chat.id, "Не знайшов угоду.", reply_markup=main_menu_kb())
         return
     pretty = html.escape(json.dumps(deal, ensure_ascii=False, indent=2))
-    await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>", reply_markup=main_menu_kb())
+    await send_safe_message(m.chat.id, f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>", reply_markup=main_menu_kb())
     await send_deal_card(m.chat.id, deal)
 
 # ----------------------------- Webhook plumbing ----------------------------
