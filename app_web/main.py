@@ -23,6 +23,7 @@ from aiogram.types import (
     Update,
     CallbackQuery,
 )
+from aiogram.exceptions import TelegramNetworkError, TelegramBadRequest
 
 from shared.settings import settings
 
@@ -40,6 +41,7 @@ B24_BASE = settings.BITRIX_WEBHOOK_BASE.rstrip("/")
 HTTP: aiohttp.ClientSession
 
 async def b24(method: str, **params) -> Any:
+    """Single call to Bitrix REST method."""
     url = f"{B24_BASE}/{method}.json"
     async with HTTP.post(url, json=params) as resp:
         data = await resp.json()
@@ -48,6 +50,7 @@ async def b24(method: str, **params) -> Any:
         return data.get("result")
 
 async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.2, **params) -> List[Dict[str, Any]]:
+    """Paginator for Bitrix list endpoints."""
     start = 0
     items: List[Dict[str, Any]] = []
     while True:
@@ -70,7 +73,7 @@ async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.2, 
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
 _ROUTER_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1602756048
 _TARIFF_ENUM_MAP: Optional[Dict[str, str]] = None      # UF_CRM_1610558031277
-_FACT_ENUM_LIST: Optional[List[Tuple[str, str]]] = None  # (ID, NAME)
+_FACT_ENUM_LIST: Optional[List[Tuple[str, str]]] = None  # (option_id, option_name)
 
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -137,7 +140,10 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     )
 
 def pick_brigade_inline_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=f"Бригада №{i}", callback_data=f"setbrig:{i}")] for i in (1, 2, 3, 4, 5)]
+    rows = [
+        [InlineKeyboardButton(text=f"Бригада №{i}", callback_data=f"setbrig:{i}")]
+        for i in (1, 2, 3, 4, 5)
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ----------------------------- Deal rendering ------------------------------
@@ -186,19 +192,19 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         try:
             c = await b24("crm.contact.get", id=deal["CONTACT_ID"])
             if c:
-                contact_name = (f"{c.get('NAME', '')} {c.get('SECOND_NAME', '')} {c.get('LAST_NAME', '')}").strip() or "—"
+                contact_name = f"{c.get('NAME', '')} {c.get('SECOND_NAME', '')} {c.get('LAST_NAME', '')}".strip() or "—"
                 phones = c.get("PHONE") or []
                 if isinstance(phones, list) and phones:
                     contact_phone = phones[0].get("VALUE") or ""
         except Exception as e:
             log.warning("contact.get failed: %s", e)
 
-    # Що зроблено + причина
+    # Показуємо “Що зроблено” + “Причина ремонту”
     fact_val = str(deal.get("UF_CRM_1602766787968") or "")
     fact_name = "—"
     if fact_val:
         facts = await get_fact_enum_list()
-        fact_name = next((name for val, name in facts if str(val) == fact_val), fact_val)
+        fact_name = next((name for val, name in facts if val == fact_val), fact_val)
 
     reason_text = (deal.get("UF_CRM_1702456465911") or "").strip() or "—"
 
@@ -241,6 +247,15 @@ async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
     await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal), disable_web_page_preview=True)
 
+# ---------------------- Safe callback answer helper ------------------------
+async def safe_callback_answer(c: CallbackQuery, text: Optional[str] = None) -> None:
+    try:
+        await c.answer(text=text, cache_time=1)
+    except (TelegramNetworkError, TelegramBadRequest) as e:
+        log.warning("callback answer failed: %s", e)
+    except Exception as e:
+        log.exception("callback answer unexpected error: %s", e)
+
 # ----------------------------- Simple storage ------------------------------
 _USER_BRIGADE: Dict[int, int] = {}
 
@@ -250,7 +265,10 @@ def get_user_brigade(user_id: int) -> Optional[int]:
 def set_user_brigade(user_id: int, brigade: int) -> None:
     _USER_BRIGADE[user_id] = brigade
 
+# mapping "brigade number" -> UF_CRM_1611995532420[] option IDs (brigade items)
 _BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
+
+# mapping brigade -> stage code in pipeline C20
 _BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
 
 # ----------------------------- Close wizard --------------------------------
@@ -265,7 +283,6 @@ def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> Inl
     start = page * _FACTS_PER_PAGE
     chunk = facts[start:start + _FACTS_PER_PAGE]
 
-    # 1 опція — 1 рядок
     for val, name in chunk:
         rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
 
@@ -302,13 +319,12 @@ async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: 
     fields = {
         "STAGE_ID": target_stage,
         "COMMENTS": new_comments,
-        "UF_CRM_1602766787968": str(fact_val),   # важливо: саме ID опції
-        "UF_CRM_1702456465911": reason_text,
+        "UF_CRM_1602766787968": fact_val,     # Що по факту зробили (enum option id)
+        "UF_CRM_1702456465911": reason_text,  # Причина ремонту (free text)
     }
     if exec_list:
-        fields["UF_CRM_1611995532420"] = exec_list
+        fields["UF_CRM_1611995532420"] = exec_list  # Виконавець (multi)
 
-    log.info("[close] deal=%s set FACT=%s (%s)", deal_id, fact_val, fact_name)
     await b24("crm.deal.update", id=deal_id, fields=fields)
 
 # ----------------------------- Report helpers ------------------------------
@@ -433,7 +449,7 @@ async def cmd_set_brigade(m: Message):
 
 @dp.callback_query(F.data.startswith("setbrig:"))
 async def cb_setbrig(c: CallbackQuery):
-    await c.answer()
+    await safe_callback_answer(c)
     try:
         brigade = int(c.data.split(":", 1)[1])
     except Exception:
@@ -469,8 +485,8 @@ async def msg_my_deals(m: Message):
             "UF_CRM_1602756048", "UF_CRM_1604468981320",
             "UF_CRM_1610558031277", "UF_CRM_1611652685839",
             "UF_CRM_1609868447208",
-            "UF_CRM_1602766787968",   # Що зроблено
-            "UF_CRM_1702456465911",   # Причина ремонту
+            "UF_CRM_1602766787968",     # Що зроблено
+            "UF_CRM_1702456465911",     # Причина ремонту
         ],
         page_size=100,
     )
@@ -482,7 +498,7 @@ async def msg_my_deals(m: Message):
 
 @dp.callback_query(F.data == "my_deals")
 async def cb_my_deals(c: CallbackQuery):
-    await c.answer()
+    await safe_callback_answer(c)
     await msg_my_deals(c.message)
 
 @dp.message(F.text == "📋 Мої задачі")
@@ -492,7 +508,7 @@ async def msg_tasks(m: Message):
 # --------- Закриття угоди: «що зроблено» + причина ------------------------
 @dp.callback_query(F.data.startswith("close:"))
 async def cb_close_deal_start(c: CallbackQuery):
-    await c.answer()
+    await safe_callback_answer(c)
     deal_id = c.data.split(":", 1)[1]
     facts = await get_fact_enum_list()
     _PENDING_CLOSE[c.from_user.id] = {"deal_id": deal_id, "stage": "pick_fact", "page": 0}
@@ -504,7 +520,7 @@ async def cb_close_deal_start(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("factpage:"))
 async def cb_fact_page(c: CallbackQuery):
-    await c.answer()
+    await safe_callback_answer(c)
     parts = c.data.split(":")
     if len(parts) < 3:
         return
@@ -521,20 +537,20 @@ async def cb_fact_page(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("factsel:"))
 async def cb_fact_select(c: CallbackQuery):
-    await c.answer()
+    await safe_callback_answer(c)
     parts = c.data.split(":")
     if len(parts) < 3:
         return
     deal_id, fact_val = parts[1], parts[2]
     facts = await get_fact_enum_list()
-    fact_name = next((n for v, n in facts if str(v) == str(fact_val)), "")
+    fact_name = next((n for v, n in facts if v == fact_val), "")
     if not fact_name:
         await c.message.answer("Не вдалося обрати значення.")
         return
     _PENDING_CLOSE[c.from_user.id] = {
         "deal_id": deal_id,
         "stage": "await_reason",
-        "fact_val": str(fact_val),
+        "fact_val": fact_val,
         "fact_name": fact_name,
     }
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -548,7 +564,7 @@ async def cb_fact_select(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reason_skip:"))
 async def cb_reason_skip(c: CallbackQuery):
-    await c.answer()
+    await safe_callback_answer(c)
     ctx = _PENDING_CLOSE.get(c.from_user.id)
     if not ctx or ctx.get("stage") != "await_reason":
         await c.message.answer("Нема активного закриття.")
@@ -569,11 +585,11 @@ async def cb_reason_skip(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("cmtcancel:"))
 async def cb_close_cancel(c: CallbackQuery):
-    await c.answer("Скасовано")
+    await safe_callback_answer(c, text="Скасовано")
     _PENDING_CLOSE.pop(c.from_user.id, None)
     await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
 
-# Текст причини ремонту
+# ---------- приймаємо ТІЛЬКИ коли чекаємо текст причини -------------------
 @dp.message(lambda m: _PENDING_CLOSE.get(m.from_user.id, {}).get("stage") == "await_reason")
 async def catch_reason_text(m: Message):
     ctx = _PENDING_CLOSE.get(m.from_user.id)
