@@ -1,5 +1,5 @@
 app = "your-telegram-bitrix-bot"
-primary_region = "waw"
+primary_region = "fra"
 
 [build]
   dockerfile = "Dockerfile"
@@ -30,4 +30,3 @@ primary_region = "waw"
 # Якщо матимете другу машину для воркера:
 [processes]
   app = "uvicorn app_web.main:app --host 0.0.0.0 --port 8080"
-  worker = "python -m worker.report_worker"
