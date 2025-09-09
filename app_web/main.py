@@ -234,7 +234,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         f"<b>Вартість роутера:</b> {html.escape(router_price)}",
         "",
         f"<b>Тариф:</b> {html.escape(tariff_name)}",
-        f"<b>Вартість тарифу:</b> {html.escape(tариф_price)}" if (тариф_price := _money_pair(deal.get("UF_CRM_1611652685839"))) else f"<b>Вартість тарифу:</b> —",  # noqa
+        f"<b>Вартість тарифу:</b> {html.escape(tariff_price)}",
         f"<b>Вартість підключення:</b> {html.escape(install_price)}",
         "",
         f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
@@ -294,10 +294,29 @@ def _phones_match(p1: str, p2: str) -> bool:
             return True
     return d1 == d2
 
+async def _search_bitrix_users_by_filters(phone_variants: List[str]) -> List[Dict[str, Any]]:
+    """Fallback: перебираємо user.get з фільтрами по трьох телефонних полях."""
+    found: List[Dict[str, Any]] = []
+    fields = ("PERSONAL_MOBILE", "PERSONAL_PHONE", "WORK_PHONE")
+    for v in phone_variants:
+        for fld in fields:
+            try:
+                log.info("[b24.find] user.get FILTER={%s: %r}", fld, v)
+                users = await b24("user.get", FILTER={fld: v, "ACTIVE": "true"})
+                if isinstance(users, list) and users:
+                    log.info("[b24.find] user.get FILTER={%s: %r} -> %d users", fld, v, len(users))
+                    found.extend(users)
+                else:
+                    log.info("[b24.find] user.get FILTER={%s: %r} -> 0 users", fld, v)
+            except Exception as e:
+                log.warning("[b24.find] user.get error for %s=%r: %s", fld, v, e)
+    return found
+
 async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     """
-    Тільки співробітники: шукаємо користувача Bitrix24 через user.search і звіряємо телефони.
-    Пробуємо кілька варіантів пошукового запиту (raw/цифри/+цифри/хвости) і все детально логуємо.
+    1) Пробуємо user.search з кількома запитами (raw/цифри/+цифри/хвости).
+    2) Якщо 0 користувачів — робимо fallback на user.get з фільтрами по персональних/робочих телефонах.
+    3) В будь-якому випадку підтверджуємо збіг телефоном через _phones_match.
     """
     raw = (phone or "").strip()
     digits = _digits_only(raw)
@@ -313,6 +332,7 @@ async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
             variants.append(digits[-9:])
 
     seen_ids = set()
+    # --- (1) user.search
     try:
         log.info("[b24.find] start search variants=%r", variants)
         for q in variants:
@@ -329,21 +349,34 @@ async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
                 if uid in seen_ids:
                     continue
                 seen_ids.add(uid)
-                phones = [
-                    u.get("PERSONAL_MOBILE"),
-                    u.get("PERSONAL_PHONE"),
-                    u.get("WORK_PHONE"),
-                ]
+                phones = [u.get("PERSONAL_MOBILE"), u.get("PERSONAL_PHONE"), u.get("WORK_PHONE")]
                 if any(_phones_match(raw, p or "") for p in phones):
                     name = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip() or (u.get("NAME") or u.get("LOGIN") or "")
-                    log.info("[b24.find] MATCH uid=%s name=%r phones=%r raw=%r", uid, name, phones, raw)
-                    return {
-                        "bx_user_id": int(u.get("ID")),
-                        "name": name,
-                        "phone": next((p for p in phones if p), raw),
-                    }
+                    log.info("[b24.find] MATCH(search) uid=%s name=%r phones=%r raw=%r", uid, name, phones, raw)
+                    return {"bx_user_id": int(u.get("ID")), "name": name, "phone": next((p for p in phones if p), raw)}
     except Exception as e:
         log.warning("Bitrix user.search failed: %s", e)
+
+    # --- (2) fallback: user.get з фільтрами
+    try:
+        get_candidates = await _search_bitrix_users_by_filters([
+            *variants,
+            # додаткові «локальні» формати
+            ("0" + digits[-9:]) if digits and len(digits) >= 9 else "",
+        ])
+        for u in get_candidates:
+            uid = u.get("ID")
+            if uid in seen_ids:
+                continue
+            seen_ids.add(uid)
+            phones = [u.get("PERSONAL_MOBILE"), u.get("PERSONAL_PHONE"), u.get("WORK_PHONE")]
+            if any(_phones_match(raw, p or "") for p in phones):
+                name = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip() or (u.get("NAME") or u.get("LOGIN") or "")
+                log.info("[b24.find] MATCH(get) uid=%s name=%r phones=%r raw=%r", uid, name, phones, raw)
+                return {"bx_user_id": int(u.get("ID")), "name": name, "phone": next((p for p in phones if p), raw)}
+    except Exception as e:
+        log.warning("Bitrix user.get fallback failed: %s", e)
+
     log.info("[b24.find] no matches for raw=%r", raw)
     return None
 
