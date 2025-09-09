@@ -234,7 +234,7 @@ async def render_deal_card(deal: Dict[str, Any]) -> str:
         f"<b>Вартість роутера:</b> {html.escape(router_price)}",
         "",
         f"<b>Тариф:</b> {html.escape(tariff_name)}",
-        f"<b>Вартість тарифу:</b> {html.escape(tariff_price)}",
+        f"<b>Вартість тарифу:</b> {html.escape(tариф_price)}" if (тариф_price := _money_pair(deal.get("UF_CRM_1611652685839"))) else f"<b>Вартість тарифу:</b> —",  # noqa
         f"<b>Вартість підключення:</b> {html.escape(install_price)}",
         "",
         f"<b>Коментар:</b> {html.escape(comments) if comments else '—'}",
@@ -297,7 +297,7 @@ def _phones_match(p1: str, p2: str) -> bool:
 async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     """
     Тільки співробітники: шукаємо користувача Bitrix24 через user.search і звіряємо телефони.
-    Пробуємо кілька варіантів пошукового запиту (raw/цифри/+цифри/хвости).
+    Пробуємо кілька варіантів пошукового запиту (raw/цифри/+цифри/хвости) і все детально логуємо.
     """
     raw = (phone or "").strip()
     digits = _digits_only(raw)
@@ -314,12 +314,16 @@ async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
 
     seen_ids = set()
     try:
+        log.info("[b24.find] start search variants=%r", variants)
         for q in variants:
             if not q:
                 continue
+            log.info("[b24.find] user.search FIND=%r", q)
             users = await b24("user.search", FIND=q)
             if not isinstance(users, list) or not users:
+                log.info("[b24.find] user.search FIND=%r -> 0 users", q)
                 continue
+            log.info("[b24.find] user.search FIND=%r -> %d users", q, len(users))
             for u in users:
                 uid = u.get("ID")
                 if uid in seen_ids:
@@ -332,6 +336,7 @@ async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
                 ]
                 if any(_phones_match(raw, p or "") for p in phones):
                     name = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip() or (u.get("NAME") or u.get("LOGIN") or "")
+                    log.info("[b24.find] MATCH uid=%s name=%r phones=%r raw=%r", uid, name, phones, raw)
                     return {
                         "bx_user_id": int(u.get("ID")),
                         "name": name,
@@ -339,6 +344,7 @@ async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
                     }
     except Exception as e:
         log.warning("Bitrix user.search failed: %s", e)
+    log.info("[b24.find] no matches for raw=%r", raw)
     return None
 
 # ----------------------------- Report taxonomy -----------------------------
@@ -546,7 +552,11 @@ async def cmd_menu(m: Message):
 # --- dev helper: швидко перевірити, що за номер приходить з Telegram
 @dp.message(Command("whoami_phone"))
 async def whoami_phone(m: Message):
-    await m.answer("Натисніть «🔐 Поділитись номером», щоб я показав, який номер отримую від Telegram.", reply_markup=auth_kb())
+    log.info("[whoami_phone] user_id=%s username=%s", m.from_user.id, m.from_user.username)
+    await m.answer(
+        "Натисніть «🔐 Поділитись номером» — я залогую номер і спроби пошуку в Bitrix.",
+        reply_markup=auth_kb()
+    )
 
 @dp.message(F.contact)
 async def handle_contact(m: Message):
@@ -559,12 +569,29 @@ async def handle_contact(m: Message):
     if not phone:
         await m.answer("Не вдалося зчитати номер телефону. Спробуйте ще раз.", reply_markup=auth_kb())
         return
+
+    # Логуємо сирий номер і варіанти
+    digits = _digits_only(phone)
+    variants: List[str] = []
+    if phone:
+        variants.append(phone.strip())
+    if digits:
+        variants.extend([digits, f"+{digits}"])
+        if len(digits) >= 10:
+            variants.append(digits[-10:])
+        if len(digits) >= 9:
+            variants.append(digits[-9:])
+    log.info("[contact] from_user_id=%s raw=%r digits=%r variants=%r", m.from_user.id, phone, digits, variants)
+
     await m.answer("Перевіряю номер у Bitrix…")
     info = await find_bitrix_user_by_phone(phone)
     if not info:
+        log.info("[auth] NOT FOUND in Bitrix for user_id=%s phone=%r", m.from_user.id, phone)
         await m.answer("На жаль, ваш номер не знайдено серед співробітників Bitrix24. Доступ не надано.")
         return
     _AUTH_USERS[m.from_user.id] = info
+    log.info("[auth] OK matched bx_user_id=%s name=%r phone=%r for tg_user_id=%s",
+             info["bx_user_id"], info["name"], info["phone"], m.from_user.id)
     await m.answer(f"✅ Авторизація успішна. Вітаю, {html.escape(info['name'])}!", reply_markup=main_menu_kb())
 
 @dp.message(F.text == "📦 Мої угоди")
