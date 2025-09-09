@@ -130,7 +130,7 @@ async def get_fact_enum_list() -> List[Tuple[str, str]]:
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📋 Мої угоди")],
+            [KeyboardButton(text="📦 Мої угоди")],
             [KeyboardButton(text="📊 Звіт за сьогодні")],
             [KeyboardButton(text="📉 Звіт за вчора")],
         ],
