@@ -900,8 +900,8 @@ async def on_contact(m: Message):
     user = await b24_find_employee_by_phone(digits)
     if not user:
         await m.answer(
-            "❌ Не знайшов співробітника з таким номером у Bitrix24.\n"
-            "Перевірте номер у профілі співробітника (поле «Мобільний») або надішліть інший.",
+            "❌ Не знайшов співробітника з таким номером .\n"
+            "Перевірте номер у профілі співробітника (поле «Мобільний»).",
             reply_markup=request_phone_kb(),
         )
         log.info("[auth] NOT FOUND in Bitrix for user_id=%s phone='%s'", m.from_user.id, digits)
