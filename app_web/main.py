@@ -102,8 +102,7 @@ def normalize_phone(raw: str) -> Tuple[str, List[str]]:
     """
     Повертає (digits, variants) для пошуку у Bitrix user.search / user.get
     Приклади:
-    +38095 215 85 28 -> digits='380952158528'
-    variants: ['380952158528', '380952158528', '+380952158528', '0952158528', '952158528']
+
     """
     digits = _digits_only(raw)
     variants: List[str] = []
