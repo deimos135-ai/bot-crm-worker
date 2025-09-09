@@ -604,7 +604,7 @@ async def cmd_start(m: Message):
     # 1) авторизація
     if not is_authed_sync(m.from_user.id):
         await m.answer(
-            "Готові працювати ✅\n\nЩоб продовжити, поділіться номером телефону (перевіримо у Bitrix24).",
+            "Готові працювати ✅\n\nЩоб продовжити, поділіться номером телефону .",
             reply_markup=request_phone_kb()
         )
         return
