@@ -22,14 +22,10 @@ from aiogram.types import (
     Message,
     Update,
     CallbackQuery,
+    Contact,
 )
 
 from shared.settings import settings
-
-# --- NEW: state shared across instances ---
-import redis.asyncio as redis
-from functools import wraps
-from time import monotonic
 
 # ----------------------------- Logging -------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -39,9 +35,6 @@ log = logging.getLogger("app")
 app = FastAPI()
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-
-# --- NEW: Redis client (set on startup) ---
-REDIS: redis.Redis
 
 # ----------------------------- Bitrix helpers ------------------------------
 B24_BASE = settings.BITRIX_WEBHOOK_BASE.rstrip("/")
@@ -75,6 +68,134 @@ async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.2, 
         if throttle:
             await asyncio.sleep(throttle)
     return items
+
+# ----------------------------- AUTH (in-memory) ----------------------------
+# Авторизація зберігається в оперативній пам'яті процеса
+_AUTH_OK: Dict[int, bool] = {}         # tg_user_id -> authed?
+# Бригада — також у пам'яті (як було у твоїй першій ревізії)
+_USER_BRIGADE: Dict[int, int] = {}     # tg_user_id -> brigade number
+
+def is_authed_sync(uid: int) -> bool:
+    return _AUTH_OK.get(uid, False)
+
+def mark_authed(uid: int) -> None:
+    _AUTH_OK[uid] = True
+
+def get_user_brigade(user_id: int) -> Optional[int]:
+    return _USER_BRIGADE.get(user_id)
+
+def set_user_brigade(user_id: int, brigade: int) -> None:
+    _USER_BRIGADE[user_id] = brigade
+
+def request_phone_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поділитись номером", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True, selective=False
+    )
+    return kb
+
+# Нормалізація телефону з Telegram/Bitrix до цифр, без пробілів/-, зі збереженням країни.
+def _digits_only(s: str) -> str:
+    return re.sub(r"\D+", "", s or "")
+
+def normalize_phone(raw: str) -> Tuple[str, List[str]]:
+    """
+    Повертає (digits, variants) для пошуку у Bitrix user.search / user.get
+    Приклади:
+    +38095 215 85 28 -> digits='380952158528'
+    variants: ['380952158528', '380952158528', '+380952158528', '0952158528', '952158528']
+    """
+    digits = _digits_only(raw)
+    variants: List[str] = []
+    if not digits:
+        return "", variants
+
+    # готуємо варіанти для різних полів і різного формату введення
+    v_e164 = digits if digits.startswith("380") else f"38{digits}" if digits.startswith("0") else digits
+    v_e164_plus = f"+{v_e164}"
+    v_nat = digits[-10:] if len(digits) >= 10 else digits  # 0XXXXXXXXX або без 0
+    if len(v_nat) == 10 and not v_nat.startswith("0"):
+        v_nat = f"0{v_nat}" if len(v_nat) == 9 else v_nat
+    v_tail9 = v_nat[-9:] if len(v_nat) >= 9 else v_nat
+
+    # Порядок важливий — від більш точного до більш «вільного»
+    variants = [v_e164, digits, v_e164_plus, v_nat, v_tail9]
+    # унікалізуємо, зберігши порядок
+    seen = set()
+    uniq: List[str] = []
+    for v in variants:
+        if v and v not in seen:
+            uniq.append(v)
+            seen.add(v)
+    return digits, uniq
+
+async def b24_find_employee_by_phone(raw_phone: str) -> Optional[Dict[str, Any]]:
+    """
+    Шукаємо тільки серед користувачів Bitrix (співробітників).
+    Повертаємо словник користувача, якщо знайдено.
+    """
+    digits, variants = normalize_phone(raw_phone)
+    log.info("[contact] raw='%s' digits='%s' variants=%s", raw_phone, digits, variants)
+    if not digits:
+        return None
+
+    # 1) user.search по FIND
+    for v in variants:
+        try:
+            log.info("[b24.find] user.search FIND='%s'", v)
+            users = await b24("user.search", FIND=v)
+            log.info("[b24.find] user.search FIND='%s' -> %s users", v, len(users or []))
+            if users:
+                # Фільтруємо за полями телефонів для впевненості
+                for u in users:
+                    phones = [
+                        (u.get("WORK_PHONE") or "").strip() or None,
+                        (u.get("PERSONAL_PHONE") or "").strip() or None,
+                        (u.get("PERSONAL_MOBILE") or "").strip() or None,
+                    ]
+                    phones = [p for p in phones if p]
+                    if any(_digits_only(p).endswith(digits[-9:]) for p in phones):
+                        log.info("[b24.find] MATCH(search) uid=%s name='%s' phones=%s raw='%s'",
+                                 u.get("ID"), f"{u.get('NAME','')} {u.get('LAST_NAME','')}".strip(), phones, raw_phone)
+                        return u
+        except Exception as e:
+            log.warning("[b24.find] user.search error for '%s': %s", v, e)
+
+    # 2) user.get по конкретних полях (найтиповіші)
+    for field in ("PERSONAL_MOBILE", "PERSONAL_PHONE", "WORK_PHONE"):
+        for v in variants:
+            try:
+                # Bitrix user.get: FILTER={FIELD: 'value'}
+                filt = {field: v}
+                log.info("[b24.find] user.get FILTER=%s", filt)
+                u = await b24("user.get", FILTER=filt)
+                if isinstance(u, list) and u:
+                    u = u[0]
+                if u and isinstance(u, dict):
+                    phones = [
+                        (u.get("WORK_PHONE") or "").strip() or None,
+                        (u.get("PERSONAL_PHONE") or "").strip() or None,
+                        (u.get("PERSONAL_MOBILE") or "").strip() or None,
+                    ]
+                    phones = [p for p in phones if p]
+                    log.info("[b24.find] MATCH(get) uid=%s name='%s' phones=%s raw='%s'",
+                             u.get("ID"), f"{u.get('NAME','')} {u.get('LAST_NAME','')}".strip(), phones, raw_phone)
+                    return u
+            except Exception as e:
+                log.warning("[b24.find] user.get error field=%s v='%s': %s", field, v, e)
+
+    log.info("[b24.find] no matches for raw='%s'", raw_phone)
+    return None
+
+async def ensure_authed_or_ask(m: Message) -> bool:
+    """Перевіряє авторизацію; якщо ні — просить поділитись номером. Повертає True якщо вже авторизований."""
+    if is_authed_sync(m.from_user.id):
+        return True
+    await m.answer(
+        "Щоб працювати з ботом, авторизуйтесь — поділіться номером телефону 👇",
+        reply_markup=request_phone_kb()
+    )
+    return False
 
 # ----------------------------- Caches --------------------------------------
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
@@ -152,14 +273,6 @@ def pick_brigade_inline_kb() -> InlineKeyboardMarkup:
         for i in (1, 2, 3, 4, 5)
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def auth_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🔐 Поділитись номером", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-        selective=False,
-    )
 
 # ----------------------------- Deal rendering ------------------------------
 def _strip_bb(text: str) -> str:
@@ -262,151 +375,67 @@ async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
     await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal), disable_web_page_preview=True)
 
-# ----------------------------- Shared state (Redis) ------------------------
-# Redis keys:
-#  auth:<tg_user_id>     -> hash { bx_user_id, name, phone }
-#  brigade:<tg_user_id>  -> string "<int>"
+# ----------------------------- Brigade mapping -----------------------------
+# mapping "brigade number" -> UF_CRM_1611995532420[] option IDs (brigade items)
+_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
+# mapping brigade -> stage code in pipeline C20
+_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
 
-# локальні LRU-кеші (лише для зменшення RTT; істина — у Redis)
-_AUTH_USERS_CACHE: Dict[int, Dict[str, Any]] = {}
-_USER_BRIGADE_CACHE: Dict[int, int] = {}
-_LAST_AUTH_PROMPT: Dict[int, float] = {}  # chat_id -> monotonic() останньої підказки
+# ----------------------------- Close wizard --------------------------------
+_PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
+_FACTS_PER_PAGE = 8  # 1 опція = 1 рядок; пагінація по 8
 
-def _digits_only(phone: str) -> str:
-    return re.sub(r"\D+", "", phone or "")
+def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
 
-def _phones_match(p1: str, p2: str) -> bool:
-    d1, d2 = _digits_only(p1), _digits_only(p2)
-    if not d1 or not d2:
-        return False
-    for k in (10, 9):
-        if len(d1) >= k and len(d2) >= k and d1[-k:] == d2[-k:]:
-            return True
-    return d1 == d2
+    start = page * _FACTS_PER_PAGE
+    chunk = facts[start:start + _FACTS_PER_PAGE]
 
-async def set_authed(uid: int, info: Dict[str, Any]) -> None:
-    _AUTH_USERS_CACHE[uid] = info
-    await REDIS.hset(f"auth:{uid}", mapping={
-        "bx_user_id": str(info.get("bx_user_id", "")),
-        "name": info.get("name", ""),
-        "phone": info.get("phone", ""),
-    })
-    # за бажанням: TTL
-    # await REDIS.expire(f"auth:{uid}", 60*60*24*30)
+    for val, name in chunk:
+        rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
 
-async def get_auth_info(uid: int) -> Optional[Dict[str, Any]]:
-    if uid in _AUTH_USERS_CACHE:
-        return _AUTH_USERS_CACHE[uid]
-    h = await REDIS.hgetall(f"auth:{uid}")
-    if h:
-        info = {"bx_user_id": int(h.get("bx_user_id") or 0), "name": h.get("name") or "", "phone": h.get("phone") or ""}
-        _AUTH_USERS_CACHE[uid] = info
-        return info
-    return None
+    if total_pages > 1:
+        nav: List[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"Стор. {page+1}/{total_pages}", callback_data="noop"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"))
+        rows.append(nav)
 
-async def is_authed(uid: int) -> bool:
-    if uid in _AUTH_USERS_CACHE:
-        return True
-    return bool(await REDIS.exists(f"auth:{uid}"))
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def get_user_brigade(user_id: int) -> Optional[int]:
-    if user_id in _USER_BRIGADE_CACHE:
-        return _USER_BRIGADE_CACHE[user_id]
-    v = await REDIS.get(f"brigade:{user_id}")
-    if v is None:
-        return None
-    try:
-        b = int(v)
-        _USER_BRIGADE_CACHE[user_id] = b
-        return b
-    except Exception:
-        return None
+async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
+    deal = await b24("crm.deal.get", id=deal_id)
+    if not deal:
+        raise RuntimeError("Deal not found")
+    category = str(deal.get("CATEGORY_ID") or "0")
+    target_stage = f"C{category}:WON"
 
-async def set_user_brigade(user_id: int, brigade: int) -> None:
-    _USER_BRIGADE_CACHE[user_id] = brigade
-    await REDIS.set(f"brigade:{user_id}", str(brigade))
+    prev_comments = _strip_bb(deal.get("COMMENTS") or "")
+    block = f"[p]<b>Закриття:</b> {html.escape(fact_name)}[/p]"
+    if reason_text:
+        block += f"\n[p]<b>Причина ремонту:</b> {html.escape(reason_text)}[/p]"
+    new_comments = block if not prev_comments else f"{prev_comments}\n\n{block}"
 
-# ----------------------------- Bitrix user search --------------------------
-async def _search_bitrix_users_by_filters(phone_variants: List[str]) -> List[Dict[str, Any]]:
-    found: List[Dict[str, Any]] = []
-    fields = ("PERSONAL_MOBILE", "PERSONAL_PHONE", "WORK_PHONE")
-    for v in phone_variants:
-        if not v:
-            continue
-        for fld in fields:
-            try:
-                log.info("[b24.find] user.get FILTER={%s: %r}", fld, v)
-                users = await b24("user.get", FILTER={fld: v, "ACTIVE": "true"})
-                if isinstance(users, list) and users:
-                    log.info("[b24.find] user.get FILTER={%s: %r} -> %d users", fld, v, len(users))
-                    found.extend(users)
-                else:
-                    log.info("[b24.find] user.get FILTER={%s: %r} -> 0 users", fld, v)
-            except Exception as e:
-                log.warning("[b24.find] user.get error for %s=%r: %s", fld, v, e)
-    return found
+    brigade = get_user_brigade(user_id)
+    exec_list = []
+    if brigade and brigade in _BRIGADE_EXEC_OPTION_ID:
+        exec_list = [_BRIGADE_EXEC_OPTION_ID[brigade]]
 
-async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
-    raw = (phone or "").strip()
-    digits = _digits_only(raw)
-    variants: List[str] = []
-    if raw:
-        variants.append(raw)
-    if digits:
-        variants.append(digits)
-        variants.append("+" + digits)
-        if len(digits) >= 10:
-            variants.append(digits[-10:])
-        if len(digits) >= 9:
-            variants.append(digits[-9:])
+    fields = {
+        "STAGE_ID": target_stage,
+        "COMMENTS": new_comments,
+        "UF_CRM_1602766787968": fact_val,     # Що по факту зробили (enum VALUE)
+        "UF_CRM_1702456465911": reason_text,  # Причина ремонту (free text)
+    }
+    if exec_list:
+        fields["UF_CRM_1611995532420"] = exec_list  # Виконавець (multi)
 
-    seen_ids = set()
-    # 1) user.search
-    try:
-        log.info("[b24.find] start search variants=%r", variants)
-        for q in variants:
-            if not q:
-                continue
-            log.info("[b24.find] user.search FIND=%r", q)
-            users = await b24("user.search", FIND=q)
-            if not isinstance(users, list) or not users:
-                log.info("[b24.find] user.search FIND=%r -> 0 users", q)
-                continue
-            log.info("[b24.find] user.search FIND=%r -> %d users", q, len(users))
-            for u in users:
-                uid = u.get("ID")
-                if uid in seen_ids:
-                    continue
-                seen_ids.add(uid)
-                phones = [u.get("PERSONAL_MOBILE"), u.get("PERSONAL_PHONE"), u.get("WORK_PHONE")]
-                if any(_phones_match(raw, p or "") for p in phones):
-                    name = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip() or (u.get("NAME") or u.get("LOGIN") or "")
-                    log.info("[b24.find] MATCH(search) uid=%s name=%r phones=%r raw=%r", uid, name, phones, raw)
-                    return {"bx_user_id": int(u.get("ID")), "name": name, "phone": next((p for p in phones if p), raw)}
-    except Exception as e:
-        log.warning("Bitrix user.search failed: %s", e)
-
-    # 2) fallback: user.get
-    try:
-        get_candidates = await _search_bitrix_users_by_filters([
-            *variants,
-            ("0" + digits[-9:]) if digits and len(digits) >= 9 else "",
-        ])
-        for u in get_candidates:
-            uid = u.get("ID")
-            if uid in seen_ids:
-                continue
-            seen_ids.add(uid)
-            phones = [u.get("PERSONAL_MOBILE"), u.get("PERSONAL_PHONE"), u.get("WORK_PHONE")]
-            if any(_phones_match(raw, p or "") for p in phones):
-                name = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip() or (u.get("NAME") or u.get("LOGIN") or "")
-                log.info("[b24.find] MATCH(get) uid=%s name=%r phones=%r raw=%r", uid, name, phones, raw)
-                return {"bx_user_id": int(u.get("ID")), "name": name, "phone": next((p for p in phones if p), raw)}
-    except Exception as e:
-        log.warning("Bitrix user.get fallback failed: %s", e)
-
-    log.info("[b24.find] no matches for raw=%r", raw)
-    return None
+    await b24("crm.deal.update", id=deal_id, fields=fields)
 
 # ----------------------------- Report taxonomy -----------------------------
 REPORT_CLASS_LABELS = {
@@ -434,28 +463,62 @@ REPORT_CLASS_ORDER = [
 ]
 
 def normalize_type(type_name: str) -> str:
+    """
+    Мапимо назву типу угоди (Bitrix, будь-якою мовою) у наш клас звіту.
+    """
     t = (type_name or "").strip().lower()
+
     mapping_exact = {
-        "підключення": "connection", "подключение": "connection",
+        "підключення": "connection",
+        "подключение": "connection",
+
         "ремонт": "repair",
-        "сервісні роботи": "service", "сервисные работы": "service", "сервіс": "service", "сервис": "service",
-        "перепідключення": "reconnection", "переподключение": "reconnection",
-        "аварія": "accident", "авария": "accident",
-        "будівництво": "construction", "строительство": "construction",
-        "роботи по лінії": "linework", "работы по линии": "linework",
-        "звернення в кц": "cc_request", "обращение в кц": "cc_request",
-        "не выбран": "other", "не вибрано": "other", "інше": "other", "прочее": "other",
+
+        "сервісні роботи": "service",
+        "сервисные работы": "service",
+        "сервіс": "service",
+        "сервис": "service",
+
+        "перепідключення": "reconnection",
+        "переподключение": "reconnection",
+
+        "аварія": "accident",
+        "авария": "accident",
+
+        "будівництво": "construction",
+        "строительство": "construction",
+
+        "роботи по лінії": "linework",
+        "работы по линии": "linework",
+
+        "звернення в кц": "cc_request",
+        "обращение в кц": "cc_request",
+
+        "не выбран": "other",
+        "не вибрано": "other",
+        "інше": "other",
+        "прочее": "other",
     }
     if t in mapping_exact:
         return mapping_exact[t]
-    if any(k in t for k in ("підключ", "подключ")): return "connection"
-    if "ремонт" in t: return "repair"
-    if any(k in t for k in ("сервіс", "сервис")): return "service"
-    if any(k in t for k in ("перепідключ", "переподключ")): return "reconnection"
-    if any(k in t for k in ("авар",)): return "accident"
-    if any(k in t for k in ("будівниц", "строит")): return "construction"
-    if any(k in t for k in ("ліні", "линии")): return "linework"
-    if any(k in t for k in ("кц", "контакт-центр", "колл-центр", "call")): return "cc_request"
+
+    # м'які правила
+    if any(k in t for k in ("підключ", "подключ")):
+        return "connection"
+    if "ремонт" in t:
+        return "repair"
+    if any(k in t for k in ("сервіс", "сервис")):
+        return "service"
+    if any(k in t for k in ("перепідключ", "переподключ")):
+        return "reconnection"
+    if any(k in t for k in ("авар",)):
+        return "accident"
+    if any(k in t for k in ("будівниц", "строит")):
+        return "construction"
+    if any(k in t for k in ("ліні", "линии")):
+        return "linework"
+    if any(k in t for k in ("кц", "контакт-центр", "колл-центр", "call")):
+        return "cc_request"
     return "other"
 
 # ----------------------------- Report helpers ------------------------------
@@ -523,68 +586,31 @@ def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_
         f"<b>Закрито задач:</b> {total}",
         "",
     ]
+    # показуємо у фіксованому порядку, ховаємо нулі
     for key in REPORT_CLASS_ORDER:
         val = counts.get(key, 0)
         if val:
             lines.append(f"{REPORT_CLASS_LABELS.get(key, key)} — {val}")
+
     if len(lines) > 3 and lines[-1] != "":
         lines.append("")
+
     lines.append(f"<b>Активних задач на бригаді залишилось:</b> {active_left}")
     return "\n".join(lines)
-
-# ----------------------------- Auth gate -----------------------------------
-def require_auth(handler):
-    from aiogram.types import Message as _Msg, CallbackQuery as _Cb
-
-    @wraps(handler)
-    async def wrapper(obj, *args, **kwargs):
-        tg_user = None
-        chat_id = None
-
-        if isinstance(obj, _Msg):
-            tg_user = obj.from_user
-            chat_id = obj.chat.id if obj.chat else None
-        elif isinstance(obj, _Cb):
-            tg_user = obj.from_user or (obj.message.from_user if obj.message else None)
-            chat_id = (obj.message.chat.id if obj.message and obj.message.chat else None)
-        else:
-            tg_user = getattr(obj, "from_user", None) or getattr(getattr(obj, "message", None), "from_user", None)
-            chat = getattr(obj, "chat", None) or getattr(getattr(obj, "message", None), "chat", None)
-            chat_id = getattr(chat, "id", None)
-
-        uid = getattr(tg_user, "id", None)
-        if uid is not None and await is_authed(uid):
-            return await handler(obj, *args, **kwargs)
-
-        if chat_id is not None:
-            now = monotonic()
-            last = _LAST_AUTH_PROMPT.get(chat_id, 0.0)
-            if now - last >= 30.0:
-                _LAST_AUTH_PROMPT[chat_id] = now
-                log.info("[auth_gate] not authed: chat_id=%s user_id=%s handler=%s",
-                         chat_id, uid, getattr(handler, "__name__", ""))
-                await bot.send_message(
-                    chat_id,
-                    "Щоб користуватись ботом, поділіться вашим номером телефону 👇",
-                    reply_markup=auth_kb()
-                )
-            else:
-                log.info("[auth_gate] suppressed prompt (<30s): chat_id=%s user_id=%s handler=%s",
-                         chat_id, uid, getattr(handler, "__name__", ""))
-        return
-    return wrapper
 
 # ----------------------------- Handlers ------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    if not await is_authed(m.from_user.id):
+    # 1) авторизація
+    if not is_authed_sync(m.from_user.id):
         await m.answer(
-            "Привіт! Спершу підтвердіть свою особу. "
-            "Натисніть кнопку нижче, щоб поділитись номером телефону:",
-            reply_markup=auth_kb()
+            "Готові працювати ✅\n\nЩоб продовжити, поділіться номером телефону (перевіримо у Bitrix24).",
+            reply_markup=request_phone_kb()
         )
         return
-    b = await get_user_brigade(m.from_user.id)
+
+    # 2) як було
+    b = get_user_brigade(m.from_user.id)
     text = "Готові працювати ✅"
     if b:
         text += f"\nПоточна бригада: №{b}"
@@ -596,11 +622,16 @@ async def cmd_start(m: Message):
 
 @dp.message(Command("menu"))
 async def cmd_menu(m: Message):
+    if not is_authed_sync(m.from_user.id):
+        await ensure_authed_or_ask(m)
+        return
     await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
 
 @dp.message(Command("set_brigade"))
-@require_auth
 async def cmd_set_brigade(m: Message):
+    if not is_authed_sync(m.from_user.id):
+        await ensure_authed_or_ask(m)
+        return
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await m.answer("Вкажіть номер бригади: /set_brigade 1", reply_markup=main_menu_kb())
@@ -614,12 +645,15 @@ async def cmd_set_brigade(m: Message):
     if brigade not in (1, 2, 3, 4, 5):
         await m.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
         return
-    await set_user_brigade(m.from_user.id, brigade)
+    set_user_brigade(m.from_user.id, brigade)
     await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data.startswith("setbrig:"))
-@require_auth
 async def cb_setbrig(c: CallbackQuery):
+    if not is_authed_sync(c.from_user.id):
+        await c.answer()
+        await c.message.answer("Спершу авторизуйтесь — поділіться номером телефону:", reply_markup=request_phone_kb())
+        return
     await c.answer()
     try:
         brigade = int(c.data.split(":", 1)[1])
@@ -629,66 +663,15 @@ async def cb_setbrig(c: CallbackQuery):
     if brigade not in (1, 2, 3, 4, 5):
         await c.message.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
         return
-    await set_user_brigade(c.from_user.id, brigade)
+    set_user_brigade(c.from_user.id, brigade)
     await c.message.answer(f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
 
-# (опційно) підсобна команда для діагностики номера
-@dp.message(Command("whoami_phone"))
-async def whoami_phone(m: Message):
-    log.info("[whoami_phone] user_id=%s username=%s", m.from_user.id, m.from_user.username)
-    await m.answer(
-        "Натисніть «🔐 Поділитись номером» — я залогую номер і спроби пошуку в Bitrix.",
-        reply_markup=auth_kb()
-    )
-
-@dp.message(F.contact)
-async def handle_contact(m: Message):
-    c = m.contact
-    if not c or (c.user_id and c.user_id != m.from_user.id):
-        await m.answer("Будь ласка, надішліть ваш власний контакт через кнопку нижче.", reply_markup=auth_kb())
-        return
-    phone = c.phone_number or ""
-    if not phone:
-        await m.answer("Не вдалося зчитати номер телефону. Спробуйте ще раз.", reply_markup=auth_kb())
-        return
-
-    digits = _digits_only(phone)
-    variants: List[str] = []
-    if phone:
-        variants.append(phone.strip())
-    if digits:
-        variants.extend([digits, f"+{digits}"])
-        if len(digits) >= 10:
-            variants.append(digits[-10:])
-        if len(digits) >= 9:
-            variants.append(digits[-9:])
-    log.info("[contact] from_user_id=%s raw=%r digits=%r variants=%r", m.from_user.id, phone, digits, variants)
-
-    await m.answer("Перевіряю номер у Bitrix…")
-    info = await find_bitrix_user_by_phone(phone)
-    if not info:
-        log.info("[auth] NOT FOUND in Bitrix for user_id=%s phone=%r", m.from_user.id, phone)
-        await m.answer("На жаль, ваш номер не знайдено серед співробітників Bitrix24. Доступ не надано.")
-        return
-
-    await set_authed(m.from_user.id, info)
-    # скинемо маркер антиспаму підказки
-    try:
-        _LAST_AUTH_PROMPT.pop(m.chat.id, None)
-    except Exception:
-        pass
-
-    log.info("[auth] OK matched bx_user_id=%s name=%r phone=%r for tg_user_id=%s",
-             info["bx_user_id"], info["name"], info["phone"], m.from_user.id)
-    await m.answer(f"✅ Авторизація успішна. Вітаю, {html.escape(info['name'])}!", reply_markup=main_menu_kb())
-
-# --- Мої угоди (залишаю оригінальний текст + дозволяю без емодзі) ---
-@dp.message(Command("my_deals"))
 @dp.message(F.text == "📦 Мої угоди")
-@dp.message(F.text.regexp(r'(?i)^\s*мої\s+угоди\s*$'))
-@require_auth
 async def msg_my_deals(m: Message):
-    brigade = await get_user_brigade(m.from_user.id)
+    if not is_authed_sync(m.from_user.id):
+        await ensure_authed_or_ask(m)
+        return
+    brigade = get_user_brigade(m.from_user.id)
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
@@ -710,6 +693,7 @@ async def msg_my_deals(m: Message):
             "UF_CRM_1602756048", "UF_CRM_1604468981320",
             "UF_CRM_1610558031277", "UF_CRM_1611652685839",
             "UF_CRM_1609868447208",
+            # для картки:
             "UF_CRM_1602766787968",     # Що зроблено
             "UF_CRM_1702456465911",     # Причина ремонту
         ],
@@ -722,46 +706,28 @@ async def msg_my_deals(m: Message):
         await send_deal_card(m.chat.id, d)
 
 @dp.callback_query(F.data == "my_deals")
-@require_auth
 async def cb_my_deals(c: CallbackQuery):
+    if not is_authed_sync(c.from_user.id):
+        await c.answer()
+        await c.message.answer("Спершу авторизуйтесь — поділіться номером телефону:", reply_markup=request_phone_kb())
+        return
     await c.answer()
     await msg_my_deals(c.message)
 
 @dp.message(F.text == "📋 Мої задачі")
-@require_auth
 async def msg_tasks(m: Message):
+    if not is_authed_sync(m.from_user.id):
+        await ensure_authed_or_ask(m)
+        return
     await m.answer("Задачі ще в розробці 🛠️", reply_markup=main_menu_kb())
 
 # --------- Закриття угоди: «що зроблено» + причина ------------------------
-_PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
-_FACTS_PER_PAGE = 8  # 1 опція = 1 рядок; пагінація по 8
-
-def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
-    page = max(0, min(page, total_pages - 1))
-
-    start = page * _FACTS_PER_PAGE
-    chunk = facts[start:start + _FACTS_PER_PAGE]
-
-    for val, name in chunk:
-        rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
-
-    if total_pages > 1:
-        nav: List[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{page-1}"))
-        nav.append(InlineKeyboardButton(text=f"Стор. {page+1}/{total_pages}", callback_data="noop"))
-        if page + 1 < total_pages:
-            nav.append(InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"))
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
 @dp.callback_query(F.data.startswith("close:"))
-@require_auth
 async def cb_close_deal_start(c: CallbackQuery):
+    if not is_authed_sync(c.from_user.id):
+        await c.answer()
+        await c.message.answer("Спершу авторизуйтесь — поділіться номером телефону:", reply_markup=request_phone_kb())
+        return
     await c.answer()
     deal_id = c.data.split(":", 1)[1]
     facts = await get_fact_enum_list()
@@ -773,7 +739,6 @@ async def cb_close_deal_start(c: CallbackQuery):
     )
 
 @dp.callback_query(F.data.startswith("factpage:"))
-@require_auth
 async def cb_fact_page(c: CallbackQuery):
     await c.answer()
     parts = c.data.split(":")
@@ -791,7 +756,6 @@ async def cb_fact_page(c: CallbackQuery):
         ctx["page"] = page
 
 @dp.callback_query(F.data.startswith("factsel:"))
-@require_auth
 async def cb_fact_select(c: CallbackQuery):
     await c.answer()
     parts = c.data.split(":")
@@ -819,7 +783,6 @@ async def cb_fact_select(c: CallbackQuery):
     )
 
 @dp.callback_query(F.data.startswith("reason_skip:"))
-@require_auth
 async def cb_reason_skip(c: CallbackQuery):
     await c.answer()
     ctx = _PENDING_CLOSE.get(c.from_user.id)
@@ -841,15 +804,18 @@ async def cb_reason_skip(c: CallbackQuery):
         _PENDING_CLOSE.pop(c.from_user.id, None)
 
 @dp.callback_query(F.data.startswith("cmtcancel:"))
-@require_auth
 async def cb_close_cancel(c: CallbackQuery):
     await c.answer("Скасовано")
     _PENDING_CLOSE.pop(c.from_user.id, None)
     await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
 
+# ---------- приймаємо ТІЛЬКИ коли чекаємо текст причини -------------------
 @dp.message(lambda m: _PENDING_CLOSE.get(m.from_user.id, {}).get("stage") == "await_reason")
-@require_auth
 async def catch_reason_text(m: Message):
+    if not is_authed_sync(m.from_user.id):
+        # теоретично не повинно статись, але про всяк
+        await ensure_authed_or_ask(m)
+        return
     ctx = _PENDING_CLOSE.get(m.from_user.id)
     deal_id = ctx["deal_id"]
     fact_val = ctx["fact_val"]
@@ -867,12 +833,12 @@ async def catch_reason_text(m: Message):
         _PENDING_CLOSE.pop(m.from_user.id, None)
 
 # ----------------------------- Reports -------------------------------------
-@dp.message(Command("report_today"))
 @dp.message(F.text == "📊 Звіт за сьогодні")
-@dp.message(F.text.regexp(r'(?i)^\s*звіт\s+за\s+сьогодні\s*$'))
-@require_auth
 async def msg_report_today(m: Message):
-    brigade = await get_user_brigade(m.from_user.id)
+    if not is_authed_sync(m.from_user.id):
+        await ensure_authed_or_ask(m)
+        return
+    brigade = get_user_brigade(m.from_user.id)
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
@@ -883,12 +849,12 @@ async def msg_report_today(m: Message):
         log.exception("report today failed")
         await m.answer(f"❗️Помилка формування звіту: {e}")
 
-@dp.message(Command("report_yesterday"))
 @dp.message(F.text == "📉 Звіт за вчора")
-@dp.message(F.text.regexp(r'(?i)^\s*звіт\s+за\s+вчора\s*$'))
-@require_auth
 async def msg_report_yesterday(m: Message):
-    brigade = await get_user_brigade(m.from_user.id)
+    if not is_authed_sync(m.from_user.id):
+        await ensure_authed_or_ask(m)
+        return
+    brigade = get_user_brigade(m.from_user.id)
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
@@ -901,8 +867,10 @@ async def msg_report_yesterday(m: Message):
 
 # ----------------------------- Dev helpers ---------------------------------
 @dp.message(Command("deal_dump"))
-@require_auth
 async def deal_dump(m: Message):
+    if not is_authed_sync(m.from_user.id):
+        await ensure_authed_or_ask(m)
+        return
     mtext = (m.text or "").strip()
     m2 = re.search(r"(\d+)", mtext)
     if not m2:
@@ -917,58 +885,57 @@ async def deal_dump(m: Message):
     await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>", reply_markup=main_menu_kb())
     await send_deal_card(m.chat.id, deal)
 
-# ----------------------------- Internal: finalize close --------------------
-_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
-_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
+# ----------------------------- AUTH handlers -------------------------------
+@dp.message(F.contact)
+async def on_contact(m: Message):
+    """Обробляємо натискання кнопки 'Поділитись номером'."""
+    c: Optional[Contact] = m.contact
+    if not c or not c.phone_number:
+        await m.answer("Не отримав номер телефону. Спробуйте ще раз:", reply_markup=request_phone_kb())
+        return
+    raw = c.phone_number
+    digits, _ = normalize_phone(raw)
+    log.info("[whoami_phone] user_id=%s username=%s", m.from_user.id, m.from_user.username or "-")
+    log.info("[contact] from_user_id=%s raw='%s' digits='%s'", m.from_user.id, raw, digits)
 
-async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
-    deal = await b24("crm.deal.get", id=deal_id)
-    if not deal:
-        raise RuntimeError("Deal not found")
-    category = str(deal.get("CATEGORY_ID") or "0")
-    target_stage = f"C{category}:WON"
+    user = await b24_find_employee_by_phone(digits)
+    if not user:
+        await m.answer(
+            "❌ Не знайшов співробітника з таким номером у Bitrix24.\n"
+            "Перевірте номер у профілі співробітника (поле «Мобільний») або надішліть інший.",
+            reply_markup=request_phone_kb(),
+        )
+        log.info("[auth] NOT FOUND in Bitrix for user_id=%s phone='%s'", m.from_user.id, digits)
+        return
 
-    prev_comments = _strip_bb(deal.get("COMMENTS") or "")
-    block = f"[p]<b>Закриття:</b> {html.escape(fact_name)}[/p]"
-    if reason_text:
-        block += f"\n[p]<b>Причина ремонту:</b> {html.escape(reason_text)}[/p]"
-    new_comments = block if not prev_comments else f"{prev_comments}\n\n{block}"
+    # Ок — авторизуємо
+    mark_authed(m.from_user.id)
+    full_name = f"{user.get('NAME','')} {user.get('LAST_NAME','')}".strip() or "—"
+    phone_dbg = (user.get("PERSONAL_MOBILE") or user.get("PERSONAL_PHONE") or user.get("WORK_PHONE") or "").strip()
+    log.info("[auth] OK matched bx_user_id=%s name='%s' phone='%s' for tg_user_id=%s",
+             user.get("ID"), full_name, phone_dbg, m.from_user.id)
 
-    brigade = await get_user_brigade(user_id)
-    exec_list = []
-    if brigade and brigade in _BRIGADE_EXEC_OPTION_ID:
-        exec_list = [_BRIGADE_EXEC_OPTION_ID[brigade]]
-
-    fields = {
-        "STAGE_ID": target_stage,
-        "COMMENTS": new_comments,
-        "UF_CRM_1602766787968": fact_val,     # Що по факту зробили (enum VALUE)
-        "UF_CRM_1702456465911": reason_text,  # Причина ремонту (free text)
-    }
-    if exec_list:
-        fields["UF_CRM_1611995532420"] = exec_list  # Виконавець (multi)
-
-    await b24("crm.deal.update", id=deal_id, fields=fields)
+    b = get_user_brigade(m.from_user.id)
+    text = f"✅ Авторизація успішна. Вітаю, {html.escape(full_name)}!"
+    if b:
+        text += f"\nПоточна бригада: №{b}"
+    else:
+        text += "\nОберіть вашу бригаду нижче ⬇️"
+    await m.answer(text, reply_markup=main_menu_kb())
+    if not b:
+        await m.answer("Швидкий вибір бригади:", reply_markup=pick_brigade_inline_kb())
 
 # ----------------------------- Webhook plumbing ----------------------------
 @app.on_event("startup")
 async def on_startup():
-    global HTTP, REDIS
+    global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
-
-    # Redis
-    redis_url = getattr(settings, "REDIS_URL", None) or "redis://localhost:6379/0"
-    REDIS = redis.from_url(redis_url, decode_responses=True)
-    log.info("[startup] Redis connected: %s", redis_url)
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Почати"),
         BotCommand(command="menu", description="Показати меню"),
         BotCommand(command="set_brigade", description="Вибрати бригаду"),
         BotCommand(command="deal_dump", description="Показати dump угоди"),
-        BotCommand(command="my_deals", description="Мої угоди"),
-        BotCommand(command="report_today", description="Звіт за сьогодні"),
-        BotCommand(command="report_yesterday", description="Звіт за вчора"),
     ])
 
     url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
@@ -979,10 +946,6 @@ async def on_startup():
 async def on_shutdown():
     await bot.delete_webhook()
     await HTTP.close()
-    try:
-        await REDIS.close()
-    except Exception:
-        pass
     await bot.session.close()
 
 @app.post("/webhook/{secret}")
