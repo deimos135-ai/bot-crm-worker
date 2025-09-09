@@ -25,8 +25,11 @@ from aiogram.types import (
 )
 
 from shared.settings import settings
+
+# --- NEW: state shared across instances ---
+import redis.asyncio as redis
 from functools import wraps
-from time import monotonic  # антиспам для повторних підказок
+from time import monotonic
 
 # ----------------------------- Logging -------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -36,6 +39,9 @@ log = logging.getLogger("app")
 app = FastAPI()
 bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+# --- NEW: Redis client (set on startup) ---
+REDIS: redis.Redis
 
 # ----------------------------- Bitrix helpers ------------------------------
 B24_BASE = settings.BITRIX_WEBHOOK_BASE.rstrip("/")
@@ -131,6 +137,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📦 Мої угоди")],
+            [KeyboardButton(text="📋 Мої задачі")],
             [KeyboardButton(text="📊 Звіт за сьогодні")],
             [KeyboardButton(text="📉 Звіт за вчора")],
         ],
@@ -148,9 +155,7 @@ def pick_brigade_inline_kb() -> InlineKeyboardMarkup:
 
 def auth_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔐 Поділитись номером", request_contact=True)],
-        ],
+        keyboard=[[KeyboardButton(text="🔐 Поділитись номером", request_contact=True)]],
         resize_keyboard=True,
         one_time_keyboard=False,
         selective=False,
@@ -257,36 +262,20 @@ async def send_deal_card(chat_id: int, deal: Dict[str, Any]) -> None:
     text = await render_deal_card(deal)
     await bot.send_message(chat_id, text, reply_markup=deal_keyboard(deal), disable_web_page_preview=True)
 
-# ----------------------------- Simple storage (brigade only) ---------------
-_USER_BRIGADE: Dict[int, int] = {}
+# ----------------------------- Shared state (Redis) ------------------------
+# Redis keys:
+#  auth:<tg_user_id>     -> hash { bx_user_id, name, phone }
+#  brigade:<tg_user_id>  -> string "<int>"
 
-def get_user_brigade(user_id: int) -> Optional[int]:
-    return _USER_BRIGADE.get(user_id)
-
-def set_user_brigade(user_id: int, brigade: int) -> None:
-    _USER_BRIGADE[user_id] = brigade
-
-# mapping "brigade number" -> UF_CRM_1611995532420[] option IDs (brigade items)
-_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
-
-# mapping brigade -> stage code in pipeline C20
-_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
-
-# ----------------------------- Auth storage --------------------------------
-_AUTH_USERS: Dict[int, Dict[str, Any]] = {}  # telegram_user_id -> {"bx_user_id": int, "name": str, "phone": str}
-_LAST_AUTH_PROMPT: Dict[int, float] = {}     # chat_id -> monotonic() останньої підказки (антиспам)
-
-def is_authed(user_id: int) -> bool:
-    return user_id in _AUTH_USERS
-
-def get_auth_info(user_id: int) -> Optional[Dict[str, Any]]:
-    return _AUTH_USERS.get(user_id)
+# локальні LRU-кеші (лише для зменшення RTT; істина — у Redis)
+_AUTH_USERS_CACHE: Dict[int, Dict[str, Any]] = {}
+_USER_BRIGADE_CACHE: Dict[int, int] = {}
+_LAST_AUTH_PROMPT: Dict[int, float] = {}  # chat_id -> monotonic() останньої підказки
 
 def _digits_only(phone: str) -> str:
     return re.sub(r"\D+", "", phone or "")
 
 def _phones_match(p1: str, p2: str) -> bool:
-    """Лояльне порівняння телефонів: звіряємо за кінцевими 9-10 цифрами."""
     d1, d2 = _digits_only(p1), _digits_only(p2)
     if not d1 or not d2:
         return False
@@ -295,8 +284,50 @@ def _phones_match(p1: str, p2: str) -> bool:
             return True
     return d1 == d2
 
+async def set_authed(uid: int, info: Dict[str, Any]) -> None:
+    _AUTH_USERS_CACHE[uid] = info
+    await REDIS.hset(f"auth:{uid}", mapping={
+        "bx_user_id": str(info.get("bx_user_id", "")),
+        "name": info.get("name", ""),
+        "phone": info.get("phone", ""),
+    })
+    # за бажанням: TTL
+    # await REDIS.expire(f"auth:{uid}", 60*60*24*30)
+
+async def get_auth_info(uid: int) -> Optional[Dict[str, Any]]:
+    if uid in _AUTH_USERS_CACHE:
+        return _AUTH_USERS_CACHE[uid]
+    h = await REDIS.hgetall(f"auth:{uid}")
+    if h:
+        info = {"bx_user_id": int(h.get("bx_user_id") or 0), "name": h.get("name") or "", "phone": h.get("phone") or ""}
+        _AUTH_USERS_CACHE[uid] = info
+        return info
+    return None
+
+async def is_authed(uid: int) -> bool:
+    if uid in _AUTH_USERS_CACHE:
+        return True
+    return bool(await REDIS.exists(f"auth:{uid}"))
+
+async def get_user_brigade(user_id: int) -> Optional[int]:
+    if user_id in _USER_BRIGADE_CACHE:
+        return _USER_BRIGADE_CACHE[user_id]
+    v = await REDIS.get(f"brigade:{user_id}")
+    if v is None:
+        return None
+    try:
+        b = int(v)
+        _USER_BRIGADE_CACHE[user_id] = b
+        return b
+    except Exception:
+        return None
+
+async def set_user_brigade(user_id: int, brigade: int) -> None:
+    _USER_BRIGADE_CACHE[user_id] = brigade
+    await REDIS.set(f"brigade:{user_id}", str(brigade))
+
+# ----------------------------- Bitrix user search --------------------------
 async def _search_bitrix_users_by_filters(phone_variants: List[str]) -> List[Dict[str, Any]]:
-    """Fallback: перебираємо user.get з фільтрами по трьох телефонних полях."""
     found: List[Dict[str, Any]] = []
     fields = ("PERSONAL_MOBILE", "PERSONAL_PHONE", "WORK_PHONE")
     for v in phone_variants:
@@ -316,11 +347,6 @@ async def _search_bitrix_users_by_filters(phone_variants: List[str]) -> List[Dic
     return found
 
 async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
-    """
-    1) Пробуємо user.search з кількома запитами (raw/цифри/+цифри/хвости).
-    2) Якщо 0 користувачів — робимо fallback на user.get з фільтрами по персональних/робочих телефонах.
-    3) В будь-якому випадку підтверджуємо збіг телефоном через _phones_match.
-    """
     raw = (phone or "").strip()
     digits = _digits_only(raw)
     variants: List[str] = []
@@ -335,7 +361,7 @@ async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
             variants.append(digits[-9:])
 
     seen_ids = set()
-    # --- (1) user.search
+    # 1) user.search
     try:
         log.info("[b24.find] start search variants=%r", variants)
         for q in variants:
@@ -360,7 +386,7 @@ async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         log.warning("Bitrix user.search failed: %s", e)
 
-    # --- (2) fallback: user.get з фільтрами
+    # 2) fallback: user.get
     try:
         get_candidates = await _search_bitrix_users_by_filters([
             *variants,
@@ -512,7 +538,6 @@ def require_auth(handler):
 
     @wraps(handler)
     async def wrapper(obj, *args, **kwargs):
-        # акуратно дістаємо user і chat з Message/CallbackQuery
         tg_user = None
         chat_id = None
 
@@ -528,10 +553,9 @@ def require_auth(handler):
             chat_id = getattr(chat, "id", None)
 
         uid = getattr(tg_user, "id", None)
-        if uid is not None and is_authed(uid):
+        if uid is not None and await is_authed(uid):
             return await handler(obj, *args, **kwargs)
 
-        # Неавторизований — показуємо підказку не частіше ніж раз на 30с
         if chat_id is not None:
             now = monotonic()
             last = _LAST_AUTH_PROMPT.get(chat_id, 0.0)
@@ -553,14 +577,14 @@ def require_auth(handler):
 # ----------------------------- Handlers ------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    if not is_authed(m.from_user.id):
+    if not await is_authed(m.from_user.id):
         await m.answer(
             "Привіт! Спершу підтвердіть свою особу. "
             "Натисніть кнопку нижче, щоб поділитись номером телефону:",
             reply_markup=auth_kb()
         )
         return
-    b = get_user_brigade(m.from_user.id)
+    b = await get_user_brigade(m.from_user.id)
     text = "Готові працювати ✅"
     if b:
         text += f"\nПоточна бригада: №{b}"
@@ -574,7 +598,6 @@ async def cmd_start(m: Message):
 async def cmd_menu(m: Message):
     await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
 
-# --- /set_brigade (як у першій ревізії) ---
 @dp.message(Command("set_brigade"))
 @require_auth
 async def cmd_set_brigade(m: Message):
@@ -591,10 +614,9 @@ async def cmd_set_brigade(m: Message):
     if brigade not in (1, 2, 3, 4, 5):
         await m.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
         return
-    set_user_brigade(m.from_user.id, brigade)
+    await set_user_brigade(m.from_user.id, brigade)
     await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
 
-# --- setbrig: (як у першій ревізії) ---
 @dp.callback_query(F.data.startswith("setbrig:"))
 @require_auth
 async def cb_setbrig(c: CallbackQuery):
@@ -607,22 +629,21 @@ async def cb_setbrig(c: CallbackQuery):
     if brigade not in (1, 2, 3, 4, 5):
         await c.message.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
         return
-    set_user_brigade(c.from_user.id, brigade)
+    await set_user_brigade(c.from_user.id, brigade)
     await c.message.answer(f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
 
-# --- dev helper: який номер віддає Telegram ---
+# (опційно) підсобна команда для діагностики номера
 @dp.message(Command("whoami_phone"))
 async def whoami_phone(m: Message):
     log.info("[whoami_phone] user_id=%s username=%s", m.from_user.id, m.from_user.username)
     await m.answer(
-        "Натисніть «🔐 Поділитись номером» — я залогую номер і спроби пошуку в CRM.",
+        "Натисніть «🔐 Поділитись номером» — я залогую номер і спроби пошуку в Bitrix.",
         reply_markup=auth_kb()
     )
 
 @dp.message(F.contact)
 async def handle_contact(m: Message):
     c = m.contact
-    # Приймаємо лише власний контакт
     if not c or (c.user_id and c.user_id != m.from_user.id):
         await m.answer("Будь ласка, надішліть ваш власний контакт через кнопку нижче.", reply_markup=auth_kb())
         return
@@ -643,14 +664,15 @@ async def handle_contact(m: Message):
             variants.append(digits[-9:])
     log.info("[contact] from_user_id=%s raw=%r digits=%r variants=%r", m.from_user.id, phone, digits, variants)
 
-    await m.answer("Перевіряю номер …")
+    await m.answer("Перевіряю номер у Bitrix…")
     info = await find_bitrix_user_by_phone(phone)
     if not info:
         log.info("[auth] NOT FOUND in Bitrix for user_id=%s phone=%r", m.from_user.id, phone)
-        await m.answer("На жаль, ваш номер не знайдено серед співробітників компанії FiberLink. Доступ не надано.")
+        await m.answer("На жаль, ваш номер не знайдено серед співробітників Bitrix24. Доступ не надано.")
         return
-    _AUTH_USERS[m.from_user.id] = info
-    # Скидаємо антиспам, щоб підказка не з'являлась знову
+
+    await set_authed(m.from_user.id, info)
+    # скинемо маркер антиспаму підказки
     try:
         _LAST_AUTH_PROMPT.pop(m.chat.id, None)
     except Exception:
@@ -660,10 +682,13 @@ async def handle_contact(m: Message):
              info["bx_user_id"], info["name"], info["phone"], m.from_user.id)
     await m.answer(f"✅ Авторизація успішна. Вітаю, {html.escape(info['name'])}!", reply_markup=main_menu_kb())
 
+# --- Мої угоди (залишаю оригінальний текст + дозволяю без емодзі) ---
+@dp.message(Command("my_deals"))
 @dp.message(F.text == "📦 Мої угоди")
+@dp.message(F.text.regexp(r'(?i)^\s*мої\s+угоди\s*$'))
 @require_auth
 async def msg_my_deals(m: Message):
-    brigade = get_user_brigade(m.from_user.id)
+    brigade = await get_user_brigade(m.from_user.id)
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
@@ -822,7 +847,6 @@ async def cb_close_cancel(c: CallbackQuery):
     _PENDING_CLOSE.pop(c.from_user.id, None)
     await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
 
-# ---------- приймаємо ТІЛЬКИ коли чекаємо текст причини -------------------
 @dp.message(lambda m: _PENDING_CLOSE.get(m.from_user.id, {}).get("stage") == "await_reason")
 @require_auth
 async def catch_reason_text(m: Message):
@@ -843,10 +867,12 @@ async def catch_reason_text(m: Message):
         _PENDING_CLOSE.pop(m.from_user.id, None)
 
 # ----------------------------- Reports -------------------------------------
+@dp.message(Command("report_today"))
 @dp.message(F.text == "📊 Звіт за сьогодні")
+@dp.message(F.text.regexp(r'(?i)^\s*звіт\s+за\s+сьогодні\s*$'))
 @require_auth
 async def msg_report_today(m: Message):
-    brigade = get_user_brigade(m.from_user.id)
+    brigade = await get_user_brigade(m.from_user.id)
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
@@ -857,10 +883,12 @@ async def msg_report_today(m: Message):
         log.exception("report today failed")
         await m.answer(f"❗️Помилка формування звіту: {e}")
 
+@dp.message(Command("report_yesterday"))
 @dp.message(F.text == "📉 Звіт за вчора")
+@dp.message(F.text.regexp(r'(?i)^\s*звіт\s+за\s+вчора\s*$'))
 @require_auth
 async def msg_report_yesterday(m: Message):
-    brigade = get_user_brigade(m.from_user.id)
+    brigade = await get_user_brigade(m.from_user.id)
     if not brigade:
         await m.answer("Спершу оберіть бригаду:", reply_markup=pick_brigade_inline_kb())
         return
@@ -889,7 +917,10 @@ async def deal_dump(m: Message):
     await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>", reply_markup=main_menu_kb())
     await send_deal_card(m.chat.id, deal)
 
-# ----------------------------- Close wizard internals ----------------------
+# ----------------------------- Internal: finalize close --------------------
+_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
+_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
+
 async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
     deal = await b24("crm.deal.get", id=deal_id)
     if not deal:
@@ -903,7 +934,7 @@ async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: 
         block += f"\n[p]<b>Причина ремонту:</b> {html.escape(reason_text)}[/p]"
     new_comments = block if not prev_comments else f"{prev_comments}\n\n{block}"
 
-    brigade = get_user_brigade(user_id)
+    brigade = await get_user_brigade(user_id)
     exec_list = []
     if brigade and brigade in _BRIGADE_EXEC_OPTION_ID:
         exec_list = [_BRIGADE_EXEC_OPTION_ID[brigade]]
@@ -922,14 +953,22 @@ async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: 
 # ----------------------------- Webhook plumbing ----------------------------
 @app.on_event("startup")
 async def on_startup():
-    global HTTP
+    global HTTP, REDIS
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+
+    # Redis
+    redis_url = getattr(settings, "REDIS_URL", None) or "redis://localhost:6379/0"
+    REDIS = redis.from_url(redis_url, decode_responses=True)
+    log.info("[startup] Redis connected: %s", redis_url)
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Почати"),
         BotCommand(command="menu", description="Показати меню"),
         BotCommand(command="set_brigade", description="Вибрати бригаду"),
         BotCommand(command="deal_dump", description="Показати dump угоди"),
+        BotCommand(command="my_deals", description="Мої угоди"),
+        BotCommand(command="report_today", description="Звіт за сьогодні"),
+        BotCommand(command="report_yesterday", description="Звіт за вчора"),
     ])
 
     url = f"{settings.WEBHOOK_BASE.rstrip('/')}/webhook/{settings.WEBHOOK_SECRET}"
@@ -940,6 +979,10 @@ async def on_startup():
 async def on_shutdown():
     await bot.delete_webhook()
     await HTTP.close()
+    try:
+        await REDIS.close()
+    except Exception:
+        pass
     await bot.session.close()
 
 @app.post("/webhook/{secret}")
