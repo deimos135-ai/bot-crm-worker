@@ -4,3 +4,4 @@ uvicorn==0.30.3
 requests==2.32.3
 asyncpg==0.29.0
 python-dotenv==1.0.1
+redis==5.0.0
