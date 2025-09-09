@@ -25,6 +25,7 @@ from aiogram.types import (
 )
 
 from shared.settings import settings
+from functools import wraps  # added
 
 # ----------------------------- Logging -------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -145,6 +146,16 @@ def pick_brigade_inline_kb() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def auth_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔐 Поділитись номером", request_contact=True)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        selective=False,
+    )
+
 # ----------------------------- Deal rendering ------------------------------
 def _strip_bb(text: str) -> str:
     if not text:
@@ -261,61 +272,52 @@ _BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
 # mapping brigade -> stage code in pipeline C20
 _BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
 
-# ----------------------------- Close wizard --------------------------------
-_PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
-_FACTS_PER_PAGE = 8  # 1 опція = 1 рядок; пагінація по 8
+# ----------------------------- Auth storage --------------------------------
+_AUTH_USERS: Dict[int, Dict[str, Any]] = {}  # telegram_user_id -> {"bx_user_id": int, "name": str, "phone": str}
 
-def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
-    page = max(0, min(page, total_pages - 1))
+def is_authed(user_id: int) -> bool:
+    return user_id in _AUTH_USERS
 
-    start = page * _FACTS_PER_PAGE
-    chunk = facts[start:start + _FACTS_PER_PAGE]
+def get_auth_info(user_id: int) -> Optional[Dict[str, Any]]:
+    return _AUTH_USERS.get(user_id)
 
-    for val, name in chunk:
-        rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
+def _digits_only(phone: str) -> str:
+    return re.sub(r"\D+", "", phone or "")
 
-    if total_pages > 1:
-        nav: List[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{page-1}"))
-        nav.append(InlineKeyboardButton(text=f"Стор. {page+1}/{total_pages}", callback_data="noop"))
-        if page + 1 < total_pages:
-            nav.append(InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"))
-        rows.append(nav)
+def _phones_match(p1: str, p2: str) -> bool:
+    """Лояльне порівняння телефонів: звіряємо за кінцевими 9-10 цифрами."""
+    d1, d2 = _digits_only(p1), _digits_only(p2)
+    if not d1 or not d2:
+        return False
+    for k in (10, 9):
+        if len(d1) >= k and len(d2) >= k and d1[-k:] == d2[-k:]:
+            return True
+    return d1 == d2
 
-    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
-    deal = await b24("crm.deal.get", id=deal_id)
-    if not deal:
-        raise RuntimeError("Deal not found")
-    category = str(deal.get("CATEGORY_ID") or "0")
-    target_stage = f"C{category}:WON"
-
-    prev_comments = _strip_bb(deal.get("COMMENTS") or "")
-    block = f"[p]<b>Закриття:</b> {html.escape(fact_name)}[/p]"
-    if reason_text:
-        block += f"\n[p]<b>Причина ремонту:</b> {html.escape(reason_text)}[/p]"
-    new_comments = block if not prev_comments else f"{prev_comments}\n\n{block}"
-
-    brigade = get_user_brigade(user_id)
-    exec_list = []
-    if brigade and brigade in _BRIGADE_EXEC_OPTION_ID:
-        exec_list = [_BRIGADE_EXEC_OPTION_ID[brigade]]
-
-    fields = {
-        "STAGE_ID": target_stage,
-        "COMMENTS": new_comments,
-        "UF_CRM_1602766787968": fact_val,     # Що по факту зробили (enum VALUE)
-        "UF_CRM_1702456465911": reason_text,  # Причина ремонту (free text)
-    }
-    if exec_list:
-        fields["UF_CRM_1611995532420"] = exec_list  # Виконавець (multi)
-
-    await b24("crm.deal.update", id=deal_id, fields=fields)
+async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+    """
+    Тільки співробітники: шукаємо користувача Bitrix24 через user.search і звіряємо телефони.
+    Повертає {"bx_user_id", "name", "phone"} або None.
+    """
+    try:
+        users = await b24("user.search", FIND=phone)
+        if isinstance(users, list):
+            for u in users:
+                phones = [
+                    u.get("PERSONAL_MOBILE"),
+                    u.get("PERSONAL_PHONE"),
+                    u.get("WORK_PHONE"),
+                ]
+                if any(_phones_match(phone, p or "") for p in phones):
+                    name = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip() or (u.get("NAME") or u.get("LOGIN") or "")
+                    return {
+                        "bx_user_id": int(u.get("ID")),
+                        "name": name,
+                        "phone": next((p for p in phones if p), phone),
+                    }
+    except Exception as e:
+        log.warning("Bitrix user.search failed: %s", e)
+    return None
 
 # ----------------------------- Report taxonomy -----------------------------
 REPORT_CLASS_LABELS = {
@@ -479,8 +481,32 @@ def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_
     return "\n".join(lines)
 
 # ----------------------------- Handlers ------------------------------------
+def require_auth(handler):
+    @wraps(handler)
+    async def wrapper(obj, *args, **kwargs):
+        tg_user = getattr(obj, "from_user", None) or getattr(getattr(obj, "message", None), "from_user", None)
+        chat = getattr(obj, "chat", None) or getattr(getattr(obj, "message", None), "chat", None)
+        chat_id = getattr(chat, "id", None)
+        if tg_user and is_authed(tg_user.id):
+            return await handler(obj, *args, **kwargs)
+        if chat_id:
+            await bot.send_message(
+                chat_id,
+                "Щоб користуватись ботом, поділіться вашим номером телефону 👇",
+                reply_markup=auth_kb()
+            )
+        return
+    return wrapper
+
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
+    if not is_authed(m.from_user.id):
+        await m.answer(
+            "Привіт! Спершу підтвердіть свою особу. "
+            "Натисніть кнопку нижче, щоб поділитись номером телефону:",
+            reply_markup=auth_kb()
+        )
+        return
     b = get_user_brigade(m.from_user.id)
     text = "Готові працювати ✅"
     if b:
@@ -495,39 +521,27 @@ async def cmd_start(m: Message):
 async def cmd_menu(m: Message):
     await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
 
-@dp.message(Command("set_brigade"))
-async def cmd_set_brigade(m: Message):
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await m.answer("Вкажіть номер бригади: /set_brigade 1", reply_markup=main_menu_kb())
-        await m.answer("Або натисніть кнопку:", reply_markup=pick_brigade_inline_kb())
+@dp.message(F.contact)
+async def handle_contact(m: Message):
+    c = m.contact
+    # Приймаємо лише власний контакт
+    if not c or (c.user_id and c.user_id != m.from_user.id):
+        await m.answer("Будь ласка, надішліть ваш власний контакт через кнопку нижче.", reply_markup=auth_kb())
         return
-    try:
-        brigade = int(parts[1])
-    except ValueError:
-        await m.answer("Номер має бути числом: 1..5", reply_markup=main_menu_kb())
+    phone = c.phone_number or ""
+    if not phone:
+        await m.answer("Не вдалося зчитати номер телефону. Спробуйте ще раз.", reply_markup=auth_kb())
         return
-    if brigade not in (1, 2, 3, 4, 5):
-        await m.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
+    await m.answer("Перевіряю номер у Bitrix…")
+    info = await find_bitrix_user_by_phone(phone)
+    if not info:
+        await m.answer("На жаль, ваш номер не знайдено серед співробітників Bitrix24. Доступ не надано.")
         return
-    set_user_brigade(m.from_user.id, brigade)
-    await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
-
-@dp.callback_query(F.data.startswith("setbrig:"))
-async def cb_setbrig(c: CallbackQuery):
-    await c.answer()
-    try:
-        brigade = int(c.data.split(":", 1)[1])
-    except Exception:
-        await c.message.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
-        return
-    if brigade not in (1, 2, 3, 4, 5):
-        await c.message.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
-        return
-    set_user_brigade(c.from_user.id, brigade)
-    await c.message.answer(f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
+    _AUTH_USERS[m.from_user.id] = info
+    await m.answer(f"✅ Авторизація успішна. Вітаю, {html.escape(info['name'])}!", reply_markup=main_menu_kb())
 
 @dp.message(F.text == "📦 Мої угоди")
+@require_auth
 async def msg_my_deals(m: Message):
     brigade = get_user_brigade(m.from_user.id)
     if not brigade:
@@ -564,16 +578,19 @@ async def msg_my_deals(m: Message):
         await send_deal_card(m.chat.id, d)
 
 @dp.callback_query(F.data == "my_deals")
+@require_auth
 async def cb_my_deals(c: CallbackQuery):
     await c.answer()
     await msg_my_deals(c.message)
 
 @dp.message(F.text == "📋 Мої задачі")
+@require_auth
 async def msg_tasks(m: Message):
     await m.answer("Задачі ще в розробці 🛠️", reply_markup=main_menu_kb())
 
 # --------- Закриття угоди: «що зроблено» + причина ------------------------
 @dp.callback_query(F.data.startswith("close:"))
+@require_auth
 async def cb_close_deal_start(c: CallbackQuery):
     await c.answer()
     deal_id = c.data.split(":", 1)[1]
@@ -586,6 +603,7 @@ async def cb_close_deal_start(c: CallbackQuery):
     )
 
 @dp.callback_query(F.data.startswith("factpage:"))
+@require_auth
 async def cb_fact_page(c: CallbackQuery):
     await c.answer()
     parts = c.data.split(":")
@@ -603,6 +621,7 @@ async def cb_fact_page(c: CallbackQuery):
         ctx["page"] = page
 
 @dp.callback_query(F.data.startswith("factsel:"))
+@require_auth
 async def cb_fact_select(c: CallbackQuery):
     await c.answer()
     parts = c.data.split(":")
@@ -630,6 +649,7 @@ async def cb_fact_select(c: CallbackQuery):
     )
 
 @dp.callback_query(F.data.startswith("reason_skip:"))
+@require_auth
 async def cb_reason_skip(c: CallbackQuery):
     await c.answer()
     ctx = _PENDING_CLOSE.get(c.from_user.id)
@@ -651,13 +671,41 @@ async def cb_reason_skip(c: CallbackQuery):
         _PENDING_CLOSE.pop(c.from_user.id, None)
 
 @dp.callback_query(F.data.startswith("cmtcancel:"))
+@require_auth
 async def cb_close_cancel(c: CallbackQuery):
     await c.answer("Скасовано")
     _PENDING_CLOSE.pop(c.from_user.id, None)
     await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
 
 # ---------- приймаємо ТІЛЬКИ коли чекаємо текст причини -------------------
+_PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
+_FACTS_PER_PAGE = 8  # 1 опція = 1 рядок; пагінація по 8
+
+def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * _FACTS_PER_PAGE
+    chunk = facts[start:start + _FACTS_PER_PAGE]
+
+    for val, name in chunk:
+        rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
+
+    if total_pages > 1:
+        nav: List[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"Стор. {page+1}/{total_pages}", callback_data="noop"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 @dp.message(lambda m: _PENDING_CLOSE.get(m.from_user.id, {}).get("stage") == "await_reason")
+@require_auth
 async def catch_reason_text(m: Message):
     ctx = _PENDING_CLOSE.get(m.from_user.id)
     deal_id = ctx["deal_id"]
@@ -677,6 +725,7 @@ async def catch_reason_text(m: Message):
 
 # ----------------------------- Reports -------------------------------------
 @dp.message(F.text == "📊 Звіт за сьогодні")
+@require_auth
 async def msg_report_today(m: Message):
     brigade = get_user_brigade(m.from_user.id)
     if not brigade:
@@ -690,6 +739,7 @@ async def msg_report_today(m: Message):
         await m.answer(f"❗️Помилка формування звіту: {e}")
 
 @dp.message(F.text == "📉 Звіт за вчора")
+@require_auth
 async def msg_report_yesterday(m: Message):
     brigade = get_user_brigade(m.from_user.id)
     if not brigade:
@@ -704,6 +754,7 @@ async def msg_report_yesterday(m: Message):
 
 # ----------------------------- Dev helpers ---------------------------------
 @dp.message(Command("deal_dump"))
+@require_auth
 async def deal_dump(m: Message):
     mtext = (m.text or "").strip()
     m2 = re.search(r"(\d+)", mtext)
@@ -718,6 +769,36 @@ async def deal_dump(m: Message):
     pretty = html.escape(json.dumps(deal, ensure_ascii=False, indent=2))
     await m.answer(f"<b>Dump угоди #{deal_id}</b>\n<pre>{pretty}</pre>", reply_markup=main_menu_kb())
     await send_deal_card(m.chat.id, deal)
+
+# ----------------------------- Close wizard internals ----------------------
+async def _finalize_close(user_id: int, deal_id: str, fact_val: str, fact_name: str, reason_text: str) -> None:
+    deal = await b24("crm.deal.get", id=deal_id)
+    if not deal:
+        raise RuntimeError("Deal not found")
+    category = str(deal.get("CATEGORY_ID") or "0")
+    target_stage = f"C{category}:WON"
+
+    prev_comments = _strip_bb(deal.get("COMMENTS") or "")
+    block = f"[p]<b>Закриття:</b> {html.escape(fact_name)}[/p]"
+    if reason_text:
+        block += f"\n[p]<b>Причина ремонту:</b> {html.escape(reason_text)}[/p]"
+    new_comments = block if not prev_comments else f"{prev_comments}\n\n{block}"
+
+    brigade = get_user_brigade(user_id)
+    exec_list = []
+    if brigade and brigade in _BRIGADE_EXEC_OPTION_ID:
+        exec_list = [_BRIGADE_EXEC_OPTION_ID[brigade]]
+
+    fields = {
+        "STAGE_ID": target_stage,
+        "COMMENTS": new_comments,
+        "UF_CRM_1602766787968": fact_val,     # Що по факту зробили (enum VALUE)
+        "UF_CRM_1702456465911": reason_text,  # Причина ремонту (free text)
+    }
+    if exec_list:
+        fields["UF_CRM_1611995532420"] = exec_list  # Виконавець (multi)
+
+    await b24("crm.deal.update", id=deal_id, fields=fields)
 
 # ----------------------------- Webhook plumbing ----------------------------
 @app.on_event("startup")
