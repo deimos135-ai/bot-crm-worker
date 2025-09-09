@@ -25,7 +25,7 @@ from aiogram.types import (
 )
 
 from shared.settings import settings
-from functools import wraps  # added
+from functools import wraps
 
 # ----------------------------- Logging -------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -297,23 +297,45 @@ def _phones_match(p1: str, p2: str) -> bool:
 async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     """
     Тільки співробітники: шукаємо користувача Bitrix24 через user.search і звіряємо телефони.
-    Повертає {"bx_user_id", "name", "phone"} або None.
+    Пробуємо кілька варіантів пошукового запиту (raw/цифри/+цифри/хвости).
     """
+    raw = (phone or "").strip()
+    digits = _digits_only(raw)
+    variants: List[str] = []
+    if raw:
+        variants.append(raw)
+    if digits:
+        variants.append(digits)
+        variants.append("+" + digits)
+        if len(digits) >= 10:
+            variants.append(digits[-10:])
+        if len(digits) >= 9:
+            variants.append(digits[-9:])
+
+    seen_ids = set()
     try:
-        users = await b24("user.search", FIND=phone)
-        if isinstance(users, list):
+        for q in variants:
+            if not q:
+                continue
+            users = await b24("user.search", FIND=q)
+            if not isinstance(users, list) or not users:
+                continue
             for u in users:
+                uid = u.get("ID")
+                if uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
                 phones = [
                     u.get("PERSONAL_MOBILE"),
                     u.get("PERSONAL_PHONE"),
                     u.get("WORK_PHONE"),
                 ]
-                if any(_phones_match(phone, p or "") for p in phones):
+                if any(_phones_match(raw, p or "") for p in phones):
                     name = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip() or (u.get("NAME") or u.get("LOGIN") or "")
                     return {
                         "bx_user_id": int(u.get("ID")),
                         "name": name,
-                        "phone": next((p for p in phones if p), phone),
+                        "phone": next((p for p in phones if p), raw),
                     }
     except Exception as e:
         log.warning("Bitrix user.search failed: %s", e)
@@ -521,6 +543,11 @@ async def cmd_start(m: Message):
 async def cmd_menu(m: Message):
     await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
 
+# --- dev helper: швидко перевірити, що за номер приходить з Telegram
+@dp.message(Command("whoami_phone"))
+async def whoami_phone(m: Message):
+    await m.answer("Натисніть «🔐 Поділитись номером», щоб я показав, який номер отримую від Telegram.", reply_markup=auth_kb())
+
 @dp.message(F.contact)
 async def handle_contact(m: Message):
     c = m.contact
@@ -589,6 +616,32 @@ async def msg_tasks(m: Message):
     await m.answer("Задачі ще в розробці 🛠️", reply_markup=main_menu_kb())
 
 # --------- Закриття угоди: «що зроблено» + причина ------------------------
+_PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
+_FACTS_PER_PAGE = 8  # 1 опція = 1 рядок; пагінація по 8
+
+def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * _FACTS_PER_PAGE
+    chunk = facts[start:start + _FACTS_PER_PAGE]
+
+    for val, name in chunk:
+        rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
+
+    if total_pages > 1:
+        nav: List[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"Стор. {page+1}/{total_pages}", callback_data="noop"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 @dp.callback_query(F.data.startswith("close:"))
 @require_auth
 async def cb_close_deal_start(c: CallbackQuery):
@@ -676,33 +729,6 @@ async def cb_close_cancel(c: CallbackQuery):
     await c.answer("Скасовано")
     _PENDING_CLOSE.pop(c.from_user.id, None)
     await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
-
-# ---------- приймаємо ТІЛЬКИ коли чекаємо текст причини -------------------
-_PENDING_CLOSE: Dict[int, Dict[str, Any]] = {}
-_FACTS_PER_PAGE = 8  # 1 опція = 1 рядок; пагінація по 8
-
-def _facts_page_kb(deal_id: str, page: int, facts: List[Tuple[str, str]]) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    total_pages = max(1, (len(facts) + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
-    page = max(0, min(page, total_pages - 1))
-
-    start = page * _FACTS_PER_PAGE
-    chunk = facts[start:start + _FACTS_PER_PAGE]
-
-    for val, name in chunk:
-        rows.append([InlineKeyboardButton(text=name[:64], callback_data=f"factsel:{deal_id}:{val}")])
-
-    if total_pages > 1:
-        nav: List[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(text="« Назад", callback_data=f"factpage:{deal_id}:{page-1}"))
-        nav.append(InlineKeyboardButton(text=f"Стор. {page+1}/{total_pages}", callback_data="noop"))
-        if page + 1 < total_pages:
-            nav.append(InlineKeyboardButton(text="Вперед »", callback_data=f"factpage:{deal_id}:{page+1}"))
-        rows.append(nav)
-
-    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=f"cmtcancel:{deal_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @dp.message(lambda m: _PENDING_CLOSE.get(m.from_user.id, {}).get("stage") == "await_reason")
 @require_auth
