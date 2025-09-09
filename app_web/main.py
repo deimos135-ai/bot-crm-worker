@@ -361,7 +361,6 @@ async def find_bitrix_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
     try:
         get_candidates = await _search_bitrix_users_by_filters([
             *variants,
-            # додаткові «локальні» формати
             ("0" + digits[-9:]) if digits and len(digits) >= 9 else "",
         ])
         for u in get_candidates:
@@ -406,62 +405,28 @@ REPORT_CLASS_ORDER = [
 ]
 
 def normalize_type(type_name: str) -> str:
-    """
-    Мапимо назву типу угоди (Bitrix, будь-якою мовою) у наш клас звіту.
-    """
     t = (type_name or "").strip().lower()
-
     mapping_exact = {
-        "підключення": "connection",
-        "подключение": "connection",
-
+        "підключення": "connection", "подключение": "connection",
         "ремонт": "repair",
-
-        "сервісні роботи": "service",
-        "сервисные работы": "service",
-        "сервіс": "service",
-        "сервис": "service",
-
-        "перепідключення": "reconnection",
-        "переподключение": "reconnection",
-
-        "аварія": "accident",
-        "авария": "accident",
-
-        "будівництво": "construction",
-        "строительство": "construction",
-
-        "роботи по лінії": "linework",
-        "работы по линии": "linework",
-
-        "звернення в кц": "cc_request",
-        "обращение в кц": "cc_request",
-
-        "не выбран": "other",
-        "не вибрано": "other",
-        "інше": "other",
-        "прочее": "other",
+        "сервісні роботи": "service", "сервисные работы": "service", "сервіс": "service", "сервис": "service",
+        "перепідключення": "reconnection", "переподключение": "reconnection",
+        "аварія": "accident", "авария": "accident",
+        "будівництво": "construction", "строительство": "construction",
+        "роботи по лінії": "linework", "работы по линии": "linework",
+        "звернення в кц": "cc_request", "обращение в кц": "cc_request",
+        "не выбран": "other", "не вибрано": "other", "інше": "other", "прочее": "other",
     }
     if t in mapping_exact:
         return mapping_exact[t]
-
-    # м'які правила
-    if any(k in t for k in ("підключ", "подключ")):
-        return "connection"
-    if "ремонт" in t:
-        return "repair"
-    if any(k in t for k in ("сервіс", "сервис")):
-        return "service"
-    if any(k in t for k in ("перепідключ", "переподключ")):
-        return "reconnection"
-    if any(k in t for k in ("авар",)):
-        return "accident"
-    if any(k in t for k in ("будівниц", "строит")):
-        return "construction"
-    if any(k in t for k in ("ліні", "линии")):
-        return "linework"
-    if any(k in t for k in ("кц", "контакт-центр", "колл-центр", "call")):
-        return "cc_request"
+    if any(k in t for k in ("підключ", "подключ")): return "connection"
+    if "ремонт" in t: return "repair"
+    if any(k in t for k in ("сервіс", "сервис")): return "service"
+    if any(k in t for k in ("перепідключ", "переподключ")): return "reconnection"
+    if any(k in t for k in ("авар",)): return "accident"
+    if any(k in t for k in ("будівниц", "строит")): return "construction"
+    if any(k in t for k in ("ліні", "линии")): return "linework"
+    if any(k in t for k in ("кц", "контакт-центр", "колл-центр", "call")): return "cc_request"
     return "other"
 
 # ----------------------------- Report helpers ------------------------------
@@ -529,19 +494,16 @@ def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_
         f"<b>Закрито задач:</b> {total}",
         "",
     ]
-    # показуємо у фіксованому порядку, ховаємо нулі
     for key in REPORT_CLASS_ORDER:
         val = counts.get(key, 0)
         if val:
             lines.append(f"{REPORT_CLASS_LABELS.get(key, key)} — {val}")
-
     if len(lines) > 3 and lines[-1] != "":
         lines.append("")
-
     lines.append(f"<b>Активних задач на бригаді залишилось:</b> {active_left}")
     return "\n".join(lines)
 
-# ----------------------------- Handlers ------------------------------------
+# ----------------------------- Auth gate -----------------------------------
 def require_auth(handler):
     @wraps(handler)
     async def wrapper(obj, *args, **kwargs):
@@ -559,6 +521,7 @@ def require_auth(handler):
         return
     return wrapper
 
+# ----------------------------- Handlers ------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     if not is_authed(m.from_user.id):
@@ -582,6 +545,42 @@ async def cmd_start(m: Message):
 async def cmd_menu(m: Message):
     await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
 
+# --- повернено: /set_brigade як у першій ревізії ---
+@dp.message(Command("set_brigade"))
+@require_auth
+async def cmd_set_brigade(m: Message):
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Вкажіть номер бригади: /set_brigade 1", reply_markup=main_menu_kb())
+        await m.answer("Або натисніть кнопку:", reply_markup=pick_brigade_inline_kb())
+        return
+    try:
+        brigade = int(parts[1])
+    except ValueError:
+        await m.answer("Номер має бути числом: 1..5", reply_markup=main_menu_kb())
+        return
+    if brigade not in (1, 2, 3, 4, 5):
+        await m.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
+        return
+    set_user_brigade(m.from_user.id, brigade)
+    await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
+
+# --- повернено: setbrig: як у першій ревізії ---
+@dp.callback_query(F.data.startswith("setbrig:"))
+@require_auth
+async def cb_setbrig(c: CallbackQuery):
+    await c.answer()
+    try:
+        brigade = int(c.data.split(":", 1)[1])
+    except Exception:
+        await c.message.answer("Невірний номер бригади.", reply_markup=main_menu_kb())
+        return
+    if brigade not in (1, 2, 3, 4, 5):
+        await c.message.answer("Доступні бригади: 1..5", reply_markup=main_menu_kb())
+        return
+    set_user_brigade(c.from_user.id, brigade)
+    await c.message.answer(f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
+
 # --- dev helper: швидко перевірити, що за номер приходить з Telegram
 @dp.message(Command("whoami_phone"))
 async def whoami_phone(m: Message):
@@ -603,7 +602,6 @@ async def handle_contact(m: Message):
         await m.answer("Не вдалося зчитати номер телефону. Спробуйте ще раз.", reply_markup=auth_kb())
         return
 
-    # Логуємо сирий номер і варіанти
     digits = _digits_only(phone)
     variants: List[str] = []
     if phone:
@@ -652,7 +650,6 @@ async def msg_my_deals(m: Message):
             "UF_CRM_1602756048", "UF_CRM_1604468981320",
             "UF_CRM_1610558031277", "UF_CRM_1611652685839",
             "UF_CRM_1609868447208",
-            # для картки:
             "UF_CRM_1602766787968",     # Що зроблено
             "UF_CRM_1702456465911",     # Причина ремонту
         ],
@@ -790,6 +787,7 @@ async def cb_close_cancel(c: CallbackQuery):
     _PENDING_CLOSE.pop(c.from_user.id, None)
     await c.message.answer("Скасовано. Угоду не змінено.", reply_markup=main_menu_kb())
 
+# ---------- приймаємо ТІЛЬКИ коли чекаємо текст причини -------------------
 @dp.message(lambda m: _PENDING_CLOSE.get(m.from_user.id, {}).get("stage") == "await_reason")
 @require_auth
 async def catch_reason_text(m: Message):
