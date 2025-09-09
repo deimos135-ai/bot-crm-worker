@@ -671,7 +671,7 @@ async def msg_contact(m: Message):
     try:
         user = await find_bx_user_by_phone(raw)
         if not user:
-            await m.answer("Не знайшов співробітника з таким номером у Bitrix.\nПеревірте номер і спробуйте ще раз.")
+            await m.answer("Не знайшов співробітника з таким номером.\nПеревірте номер і спробуйте ще раз.")
             return
 
         set_authed(m.from_user.id)
