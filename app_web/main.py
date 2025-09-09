@@ -26,6 +26,7 @@ from aiogram.types import (
 
 from shared.settings import settings
 from functools import wraps
+from time import monotonic  # антиспам для повторних підказок
 
 # ----------------------------- Logging -------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -274,6 +275,7 @@ _BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z"
 
 # ----------------------------- Auth storage --------------------------------
 _AUTH_USERS: Dict[int, Dict[str, Any]] = {}  # telegram_user_id -> {"bx_user_id": int, "name": str, "phone": str}
+_LAST_AUTH_PROMPT: Dict[int, float] = {}     # chat_id -> monotonic() останньої підказки (антиспам)
 
 def is_authed(user_id: int) -> bool:
     return user_id in _AUTH_USERS
@@ -299,6 +301,8 @@ async def _search_bitrix_users_by_filters(phone_variants: List[str]) -> List[Dic
     found: List[Dict[str, Any]] = []
     fields = ("PERSONAL_MOBILE", "PERSONAL_PHONE", "WORK_PHONE")
     for v in phone_variants:
+        if not v:
+            continue
         for fld in fields:
             try:
                 log.info("[b24.find] user.get FILTER={%s: %r}", fld, v)
@@ -505,19 +509,45 @@ def format_report(brigade: int, date_label: str, counts: Dict[str, int], active_
 
 # ----------------------------- Auth gate -----------------------------------
 def require_auth(handler):
+    from aiogram.types import Message as _Msg, CallbackQuery as _Cb
+
     @wraps(handler)
     async def wrapper(obj, *args, **kwargs):
-        tg_user = getattr(obj, "from_user", None) or getattr(getattr(obj, "message", None), "from_user", None)
-        chat = getattr(obj, "chat", None) or getattr(getattr(obj, "message", None), "chat", None)
-        chat_id = getattr(chat, "id", None)
-        if tg_user and is_authed(tg_user.id):
+        # акуратно дістаємо user і chat з Message/CallbackQuery
+        tg_user = None
+        chat_id = None
+
+        if isinstance(obj, _Msg):
+            tg_user = obj.from_user
+            chat_id = obj.chat.id if obj.chat else None
+        elif isinstance(obj, _Cb):
+            tg_user = obj.from_user or (obj.message.from_user if obj.message else None)
+            chat_id = (obj.message.chat.id if obj.message and obj.message.chat else None)
+        else:
+            tg_user = getattr(obj, "from_user", None) or getattr(getattr(obj, "message", None), "from_user", None)
+            chat = getattr(obj, "chat", None) or getattr(getattr(obj, "message", None), "chat", None)
+            chat_id = getattr(chat, "id", None)
+
+        uid = getattr(tg_user, "id", None)
+        if uid is not None and is_authed(uid):
             return await handler(obj, *args, **kwargs)
-        if chat_id:
-            await bot.send_message(
-                chat_id,
-                "Щоб користуватись ботом, поділіться вашим номером телефону 👇",
-                reply_markup=auth_kb()
-            )
+
+        # Неавторизований — показуємо підказку не частіше ніж раз на 30с
+        if chat_id is not None:
+            now = monotonic()
+            last = _LAST_AUTH_PROMPT.get(chat_id, 0.0)
+            if now - last >= 30.0:
+                _LAST_AUTH_PROMPT[chat_id] = now
+                log.info("[auth_gate] not authed: chat_id=%s user_id=%s handler=%s",
+                         chat_id, uid, getattr(handler, "__name__", ""))
+                await bot.send_message(
+                    chat_id,
+                    "Щоб користуватись ботом, поділіться вашим номером телефону 👇",
+                    reply_markup=auth_kb()
+                )
+            else:
+                log.info("[auth_gate] suppressed prompt (<30s): chat_id=%s user_id=%s handler=%s",
+                         chat_id, uid, getattr(handler, "__name__", ""))
         return
     return wrapper
 
@@ -545,7 +575,7 @@ async def cmd_start(m: Message):
 async def cmd_menu(m: Message):
     await m.answer("Меню відкрито 👇", reply_markup=main_menu_kb())
 
-# --- повернено: /set_brigade як у першій ревізії ---
+# --- /set_brigade (як у першій ревізії) ---
 @dp.message(Command("set_brigade"))
 @require_auth
 async def cmd_set_brigade(m: Message):
@@ -565,7 +595,7 @@ async def cmd_set_brigade(m: Message):
     set_user_brigade(m.from_user.id, brigade)
     await m.answer(f"✅ Прив’язано до бригади №{brigade}", reply_markup=main_menu_kb())
 
-# --- повернено: setbrig: як у першій ревізії ---
+# --- setbrig: (як у першій ревізії) ---
 @dp.callback_query(F.data.startswith("setbrig:"))
 @require_auth
 async def cb_setbrig(c: CallbackQuery):
@@ -581,7 +611,7 @@ async def cb_setbrig(c: CallbackQuery):
     set_user_brigade(c.from_user.id, brigade)
     await c.message.answer(f"✅ Обрано бригаду №{brigade}", reply_markup=main_menu_kb())
 
-# --- dev helper: швидко перевірити, що за номер приходить з Telegram
+# --- dev helper: який номер віддає Telegram ---
 @dp.message(Command("whoami_phone"))
 async def whoami_phone(m: Message):
     log.info("[whoami_phone] user_id=%s username=%s", m.from_user.id, m.from_user.username)
@@ -621,6 +651,12 @@ async def handle_contact(m: Message):
         await m.answer("На жаль, ваш номер не знайдено серед співробітників Bitrix24. Доступ не надано.")
         return
     _AUTH_USERS[m.from_user.id] = info
+    # Скидаємо антиспам, щоб підказка не з'являлась знову
+    try:
+        _LAST_AUTH_PROMPT.pop(m.chat.id, None)
+    except Exception:
+        pass
+
     log.info("[auth] OK matched bx_user_id=%s name=%r phone=%r for tg_user_id=%s",
              info["bx_user_id"], info["name"], info["phone"], m.from_user.id)
     await m.answer(f"✅ Авторизація успішна. Вітаю, {html.escape(info['name'])}!", reply_markup=main_menu_kb())
