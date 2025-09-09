@@ -130,8 +130,7 @@ async def get_fact_enum_list() -> List[Tuple[str, str]]:
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📦 Мої угоди")],
-            [KeyboardButton(text="📋 Мої задачі")],
+            [KeyboardButton(text="📋 Мої угоди")],
             [KeyboardButton(text="📊 Звіт за сьогодні")],
             [KeyboardButton(text="📉 Звіт за вчора")],
         ],
@@ -616,7 +615,7 @@ async def cb_setbrig(c: CallbackQuery):
 async def whoami_phone(m: Message):
     log.info("[whoami_phone] user_id=%s username=%s", m.from_user.id, m.from_user.username)
     await m.answer(
-        "Натисніть «🔐 Поділитись номером» — я залогую номер і спроби пошуку в Bitrix.",
+        "Натисніть «🔐 Поділитись номером» — я залогую номер і спроби пошуку в CRM.",
         reply_markup=auth_kb()
     )
 
@@ -644,11 +643,11 @@ async def handle_contact(m: Message):
             variants.append(digits[-9:])
     log.info("[contact] from_user_id=%s raw=%r digits=%r variants=%r", m.from_user.id, phone, digits, variants)
 
-    await m.answer("Перевіряю номер у Bitrix…")
+    await m.answer("Перевіряю номер …")
     info = await find_bitrix_user_by_phone(phone)
     if not info:
         log.info("[auth] NOT FOUND in Bitrix for user_id=%s phone=%r", m.from_user.id, phone)
-        await m.answer("На жаль, ваш номер не знайдено серед співробітників Bitrix24. Доступ не надано.")
+        await m.answer("На жаль, ваш номер не знайдено серед співробітників компанії FiberLink. Доступ не надано.")
         return
     _AUTH_USERS[m.from_user.id] = info
     # Скидаємо антиспам, щоб підказка не з'являлась знову
